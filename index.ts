@@ -51,9 +51,11 @@ export {
 } from "./metadata.ts";
 export {
   applyDiscovered,
+  buildRefreshSummary,
   computeDueTargets,
   createConfigWatch,
   createStoreAuthResolver,
+  formatRescanAck,
   pollProvider,
   requestImmediateRefresh,
   resetWarnedParametersKeys,
@@ -80,6 +82,7 @@ export type {
 } from "./metadata.ts";
 export type {
   ConfigWatchHandle,
+  RefreshSummary,
   ResolvedStoreCredential,
   StoreAuthResolver,
 } from "./runtime.ts";

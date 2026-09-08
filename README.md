@@ -99,6 +99,7 @@ An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) 
 - Failed polls (timeout, non-2xx, bad JSON) keep the provider's last-good models — a transient outage never empties the catalog.
 - A successful empty poll removes previously discovered models; models you registered yourself are never touched.
 - Your own model names are preserved — the plugin only names a model when none exists.
+- The `models-discovery-rescan` command posts session acknowledgements: a "started" message immediately, then a sanitized summary (`N model(s) across M provider(s)`, plus any providers that failed and kept their last known models) when the cycle completes. Invocations without a session stay silent.
 - `cacheFor` gates on the last **successful** poll; caching never delays recovery. The `models-discovery-rescan` command bypasses interval and TTL.
 - Config edits apply via the config-file watch (~0.5 s debounce) or the next poll cycle.
 - Refreshes are serialized with a generation guard: a slow poll can't commit stale results over a newer one.

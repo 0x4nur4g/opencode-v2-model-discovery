@@ -18,11 +18,18 @@ interface CatalogDraftLite {
   };
 }
 
+interface CommandContextLite {
+  /** Session the command was invoked in; absent for headless invocations. */
+  sessionID?: string;
+  prompt?: { text?: string };
+  delivery?: string;
+}
+
 interface CommandDraftLite {
   add(command: {
     name: string;
     description?: string;
-    execute: () => unknown | Promise<unknown>;
+    execute: (context?: CommandContextLite) => unknown | Promise<unknown>;
   }): void;
 }
 
@@ -42,6 +49,14 @@ interface PluginContextLite {
   integration?: IntegrationApiLite;
   /** Command registration surface; absent on runtimes without the command API. */
   command?: CommandTransformApiLite;
+  /**
+   * Session surface for user-visible command acknowledgements; absent in
+   * mocks and runtimes without it. `synthetic` posts a synthetic session
+   * message without triggering an agent run.
+   */
+  session?: {
+    synthetic(input: { sessionID: string; text: string; description?: string }): Promise<unknown>;
+  };
   /** Event subscription surface; no unsubscribe handle is exposed. */
   event?: {
     subscribe(topic: string, cb: (...args: unknown[]) => void): unknown;

@@ -10,12 +10,14 @@ import {
   POLL_TIMEOUT_MS,
   applyDiscovered,
   buildCatalogJoin,
+  buildRefreshSummary,
   computeDueTargets,
   createConfigWatch,
   createStoreAuthResolver,
   discoveredModelName,
   entryMatches,
   extractEntries,
+  formatRescanAck,
   mergeProviderConfigs,
   mergeTargets,
   parseCacheForSeconds,
@@ -45,6 +47,7 @@ import {
   setImmediateRefreshHook,
   setup,
 } from "opencode-v2-model-discovery";
+import type { ModelEntry } from "opencode-v2-model-discovery";
 
 function catalogModel(name: string, metadata: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -1245,6 +1248,48 @@ describe("rescan triggers", () => {
     expect(calls).toBe(2);
   });
 
+  test("buildRefreshSummary separates successful polls (including empty) from failures", () => {
+    const due = [{ id: "a" }, { id: "b" }, { id: "c" }];
+    const results = new Map<string, ModelEntry[] | undefined>([
+      ["a", [{ id: "a1" }, { id: "a2" }]],
+      ["b", []],
+      ["c", undefined],
+    ]);
+    const summary = buildRefreshSummary(due, results);
+    expect(summary.outcome).toBe("complete");
+    expect(summary.polled).toBe(3);
+    expect(summary.discoveredCounts).toEqual([
+      ["a", 2],
+      ["b", 0],
+    ]);
+    expect(summary.failed).toEqual(["c"]);
+  });
+
+  test("formatRescanAck renders counts, failures, and the error outcome", () => {
+    expect(
+      formatRescanAck({
+        outcome: "complete",
+        polled: 2,
+        discoveredCounts: [
+          ["a", 2],
+          ["b", 0],
+        ],
+        failed: [],
+      }),
+    ).toBe("Models-discovery rescan complete: 2 model(s) across 2 provider(s).");
+    expect(
+      formatRescanAck({
+        outcome: "complete",
+        polled: 2,
+        discoveredCounts: [["a", 3]],
+        failed: ["b"],
+      }),
+    ).toBe("Models-discovery rescan complete: 3 model(s) across 1 provider(s). Failed, kept last known: b.");
+    expect(formatRescanAck({ outcome: "error", polled: 0, discoveredCounts: [], failed: [] })).toBe(
+      "Models-discovery rescan failed; previous models kept. Check server logs.",
+    );
+  });
+
   test("setup wires the immediate-refresh hook end to end", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-wire-"));
     const configPath = path.join(dir, "explicit.json");
@@ -1306,6 +1351,104 @@ describe("rescan triggers", () => {
       requestImmediateRefresh();
       await flush();
       expect(fetchCount).toBe(3);
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rescan command posts session acks for start and completion, headless stays silent", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-ack-"));
+    const configPath = path.join(dir, "explicit.json");
+    fs.writeFileSync(configPath, "{}");
+    const previousCwd = process.cwd();
+    const previousEnv = {
+      OPENCODE_CONFIG: process.env.OPENCODE_CONFIG,
+      OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
+      OPENCODE_CONFIG_CONTENT: process.env.OPENCODE_CONFIG_CONTENT,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      HOME: process.env.HOME,
+    };
+    const restore = (): void => {
+      process.chdir(previousCwd);
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    process.env.OPENCODE_CONFIG = configPath;
+    process.env.OPENCODE_CONFIG_DIR = path.join(dir, "cfgdir");
+    process.env.XDG_CONFIG_HOME = path.join(dir, "xdg");
+    process.env.HOME = path.join(dir, "home");
+    delete process.env.OPENCODE_CONFIG_CONTENT;
+    process.chdir(dir);
+
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (cb: () => void): number => {
+      return 1;
+    };
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "ack-m" }] }), { status: 200 });
+    };
+    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    let registered:
+      | { name: string; execute: (context?: { sessionID?: string }) => Promise<void> | void }
+      | undefined;
+    const context = {
+      options: { providers: [{ id: "ackw", baseURL: "https://ackw.invalid/v1" }] },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+      command: {
+        transform: async (callback: (draft: { add(command: unknown): void }) => void) => {
+          callback({
+            add: (command: unknown) => {
+              registered = command as {
+                name: string;
+                execute: (context?: { sessionID?: string }) => Promise<void> | void;
+              };
+            },
+          });
+          return { dispose: async () => {} };
+        },
+      },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          acks.push(input);
+          return { id: "msg_ack_test" };
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      expect(registered?.name).toBe("models-discovery-rescan");
+      expect(registered?.description).toBe("Rescan discovered models now");
+      expect(acks.length).toBe(0);
+
+      await registered!.execute({ sessionID: "ses_ack_test" });
+      expect(acks.length).toBe(2);
+      expect(acks[0]).toEqual({
+        sessionID: "ses_ack_test",
+        text: "Models-discovery rescan started.",
+        description: "models-discovery-rescan",
+      });
+      expect(acks[1].text).toBe(
+        "Models-discovery rescan complete: 1 model(s) across 1 provider(s).",
+      );
+      expect(acks[1].description).toBe("models-discovery-rescan");
+
+      // Headless invocation (no sessionID) still refreshes but posts no acks.
+      const fetchBefore = fetchCount;
+      await registered!.execute({});
+      expect(fetchCount).toBeGreaterThan(fetchBefore);
+      expect(acks.length).toBe(2);
+      await cleanup?.();
     } finally {
       restore();
       globalThis.fetch = previousFetch;

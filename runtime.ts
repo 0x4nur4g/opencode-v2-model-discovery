@@ -510,6 +510,51 @@ export function setImmediateRefreshHook(hook: (() => void) | undefined): void {
   immediateRefreshHook = hook;
 }
 
+/** Sanitized per-cycle outcome for user-visible acks; carries no raw errors. */
+export interface RefreshSummary {
+  /** "complete" = cycle ran (per-provider failures are in `failed`); "error" = cycle threw. */
+  outcome: "complete" | "error";
+  /** Targets polled this cycle. */
+  polled: number;
+  /** providerID → discovered model count, successful polls only. */
+  discoveredCounts: Array<[string, number]>;
+  /** Provider ids whose poll failed this cycle; last-good is kept for them. */
+  failed: string[];
+}
+
+/**
+ * Summarize one refresh cycle from its poll results for ack surfaces.
+ * `results` maps providerID → models; `undefined` marks a failed poll.
+ */
+export function buildRefreshSummary(
+  due: readonly { id: string }[],
+  results: ReadonlyMap<string, readonly ModelEntry[] | undefined>,
+): RefreshSummary {
+  const discoveredCounts: Array<[string, number]> = [];
+  const failed: string[] = [];
+  for (const target of due) {
+    const models = results.get(target.id);
+    if (models === undefined) failed.push(target.id);
+    else discoveredCounts.push([target.id, models.length]);
+  }
+  return { outcome: "complete", polled: due.length, discoveredCounts, failed };
+}
+
+/** Format a rescan ack message; sanitized (ids and counts only, never errors). */
+export function formatRescanAck(summary: RefreshSummary): string {
+  if (summary.outcome === "error") {
+    return "Models-discovery rescan failed; previous models kept. Check server logs.";
+  }
+  const total = summary.discoveredCounts.reduce((sum, [, count]) => sum + count, 0);
+  const parts = [
+    `Models-discovery rescan complete: ${total} model(s) across ${summary.discoveredCounts.length} provider(s).`,
+  ];
+  if (summary.failed.length > 0) {
+    parts.push(`Failed, kept last known: ${summary.failed.join(", ")}.`);
+  }
+  return parts.join(" ");
+}
+
 /**
  * Poll the due subset of the desired targets; target-less cycles refresh
  * nothing. A target is due when its interval has elapsed AND, when a cache
@@ -797,77 +842,85 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   }
 
   let latestGeneration = 0;
-  let refreshQueue = Promise.resolve();
+  let refreshQueue: Promise<RefreshSummary | undefined> = Promise.resolve(undefined);
   const lastPolledMs = new Map<string, number>();
   // Last SUCCESSFUL poll per provider; the cache TTL gates on this clock.
   const lastSuccessMs = new Map<string, number>();
 
   type RefreshMode = "normal" | "force" | "watch";
 
-  const refreshGeneration = async (generation: number, mode: RefreshMode): Promise<void> => {
-    const freshAutoTargets = discoverAuto(
-      runtimeConfigSources(),
-      disabledIds,
-      warnedConfigProblems,
-      globalParametersPath,
-    );
-    const desired = mergeTargets(manualTargets, freshAutoTargets);
-    // force bypasses both interval and cache TTL (rescan command); watch skips
-    // the interval gate but still respects the TTL (config-file edits); normal
-    // requires the interval AND stale-or-unset TTL.
-    const due =
-      mode === "force"
-        ? desired
-        : computeDueTargets(
-            desired,
-            lastPolledMs,
-            Date.now(),
-            globalIntervalSeconds,
-            lastSuccessMs,
-            globalCacheForSeconds,
-            mode === "watch",
-          );
-    // Mark attempt time BEFORE polling so failing providers never respin on
-    // the next tick; a successful commit is what actually refreshes catalog.
-    const attemptedAt = Date.now();
-    for (const target of due) lastPolledMs.set(target.id, attemptedAt);
-    const storeAuthResolver = createStoreAuthResolver(ctx);
-    await enrichTargetsWithStoreAuth(due, storeAuthResolver);
-    const results = await pollAll(due, globalPollTimeoutMs, {
-      cacheForSeconds: globalCacheForSeconds,
-      intervalSeconds: globalIntervalSeconds,
-      bypassParameterCache: mode === "force",
-    });
-    if (generation !== latestGeneration) return;
-
-    const desiredIds = new Set(desired.map((target) => target.id));
-    for (const target of targets) {
-      if (desiredIds.has(target.id)) continue;
-      const owned = ownedModelIds.get(target.id) ?? new Set<string>();
-      queueRemovals(target.id, owned);
-      ownedModelIds.delete(target.id);
-      discovered.delete(target.id);
-      console.log(
-        `${LOG_PREFIX} Provider "${target.id}" removed from config; dropping ${owned.size} discovered model(s)`,
+  const refreshGeneration = async (
+    generation: number,
+    mode: RefreshMode,
+  ): Promise<RefreshSummary | undefined> => {
+    try {
+      const freshAutoTargets = discoverAuto(
+        runtimeConfigSources(),
+        disabledIds,
+        warnedConfigProblems,
+        globalParametersPath,
       );
+      const desired = mergeTargets(manualTargets, freshAutoTargets);
+      // force bypasses both interval and cache TTL (rescan command); watch skips
+      // the interval gate but still respects the TTL (config-file edits); normal
+      // requires the interval AND stale-or-unset TTL.
+      const due =
+        mode === "force"
+          ? desired
+          : computeDueTargets(
+              desired,
+              lastPolledMs,
+              Date.now(),
+              globalIntervalSeconds,
+              lastSuccessMs,
+              globalCacheForSeconds,
+              mode === "watch",
+            );
+      // Mark attempt time BEFORE polling so failing providers never respin on
+      // the next tick; a successful commit is what actually refreshes catalog.
+      const attemptedAt = Date.now();
+      for (const target of due) lastPolledMs.set(target.id, attemptedAt);
+      const storeAuthResolver = createStoreAuthResolver(ctx);
+      await enrichTargetsWithStoreAuth(due, storeAuthResolver);
+      const results = await pollAll(due, globalPollTimeoutMs, {
+        cacheForSeconds: globalCacheForSeconds,
+        intervalSeconds: globalIntervalSeconds,
+        bypassParameterCache: mode === "force",
+      });
+      if (generation !== latestGeneration) return undefined;
+
+      const desiredIds = new Set(desired.map((target) => target.id));
+      for (const target of targets) {
+        if (desiredIds.has(target.id)) continue;
+        const owned = ownedModelIds.get(target.id) ?? new Set<string>();
+        queueRemovals(target.id, owned);
+        ownedModelIds.delete(target.id);
+        discovered.delete(target.id);
+        console.log(
+          `${LOG_PREFIX} Provider "${target.id}" removed from config; dropping ${owned.size} discovered model(s)`,
+        );
+      }
+      targets = desired;
+      applyPollResults(results);
+      await ctx.catalog.reload();
+      return buildRefreshSummary(due, results);
+    } catch {
+      safeFailure("refresh", "runtime");
+      return { outcome: "error", polled: 0, discoveredCounts: [], failed: [] };
     }
-    targets = desired;
-    applyPollResults(results);
-    await ctx.catalog.reload();
   };
 
-  const scheduleRefresh = (mode: RefreshMode = "normal"): Promise<void> => {
+  const scheduleRefresh = (mode: RefreshMode = "normal"): Promise<RefreshSummary | undefined> => {
     const generation = ++latestGeneration;
-    refreshQueue = refreshQueue
-      .then(() => refreshGeneration(generation, mode))
-      .catch(() => safeFailure("refresh", "runtime"));
+    refreshQueue = refreshQueue.then(() => refreshGeneration(generation, mode));
     return refreshQueue;
   };
 
-  /** Immediate refresh bypassing interval and cache TTL; the guard dedupes races. */
-  const forceRefresh = (): void => {
-    void scheduleRefresh("force");
-  };
+  /**
+   * Immediate refresh bypassing interval and cache TTL; the guard dedupes
+   * races. Returns the cycle's summary, or undefined when superseded.
+   */
+  const forceRefresh = (): Promise<RefreshSummary | undefined> => scheduleRefresh("force");
 
   /** Immediate refresh that still respects each target's cache TTL. */
   const watchRefresh = (): void => {
@@ -916,8 +969,31 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         draft.add({
           name: "models-discovery-rescan",
           description: "Rescan discovered models now",
-          execute: async (): Promise<void> => {
-            requestImmediateRefresh();
+          execute: async (context): Promise<void> => {
+            const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined;
+            const sessionApi = ctx.session;
+            // Best-effort session ack: never fail the rescan over a missing
+            // session surface or a rejected synthetic post.
+            const ack = (text: string): void => {
+              if (sessionID === undefined) return;
+              try {
+                const posted = sessionApi?.synthetic?.({
+                  sessionID,
+                  text,
+                  description: "models-discovery-rescan",
+                });
+                if (posted && typeof posted.catch === "function") posted.catch(() => {});
+              } catch {
+                // Ack is cosmetic; a failing ack surface must not break the scan.
+              }
+            };
+            ack("Models-discovery rescan started.");
+            const summary = await forceRefresh();
+            if (summary === undefined) {
+              ack("Models-discovery rescan superseded by a newer refresh.");
+              return;
+            }
+            ack(formatRescanAck(summary));
           },
         });
       });
