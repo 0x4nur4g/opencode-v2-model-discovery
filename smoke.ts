@@ -50,6 +50,7 @@ async function main(): Promise<void> {
     "OPENCODE_CONFIG_PROJECT_DISABLE",
     "OPENCODE_DISABLE_PROJECT_CONFIG",
     "OPENCODE_MODELS_DISCOVERY_DEFAULT_ENABLED",
+    "OPENCODE_MODELS_DISCOVERY_STATE_FILE",
     "XDG_CONFIG_HOME",
     "HOME",
   ] as const;
@@ -61,6 +62,11 @@ async function main(): Promise<void> {
   process.env.OPENCODE_CONFIG = explicitConfigPath;
   process.env.XDG_CONFIG_HOME = xdgConfigHome;
   process.env.HOME = homeDir;
+  // Pin the discovery state file under the smoke config root so setup() calls
+  // never read or write the operator's real state dir; configRoot is removed
+  // in cleanup below.
+  const smokeStatePath = path.join(configRoot, "model-discovery", "state.json");
+  process.env.OPENCODE_MODELS_DISCOVERY_STATE_FILE = smokeStatePath;
 
   const { default: plugin, requestImmediateRefresh } = await import("opencode-v2-model-discovery");
 

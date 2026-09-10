@@ -107,6 +107,10 @@
   //   Missing, unreadable, or malformed sources warn safely and do not block
   //   later sources. OPENCODE_MODELS_DISCOVERY_DEFAULT_ENABLED=true/false
   //   controls the default when a provider has no explicit flag.
+  //   The plugin snapshots poll clocks/counts to
+  //   ${XDG_STATE_HOME:-~/.local/state}/opencode/model-discovery/state.json
+  //   (never credentials); OPENCODE_MODELS_DISCOVERY_STATE_FILE overrides the
+  //   path. Restart seeding honors a running cacheFor TTL across restarts.
   //   `/api/plugin` listed active path plugins in current-beta probes for both
   //   forms, but remains non-authoritative; use logs and catalog behavior.
   // ---------------------------------------------------------------------------

@@ -79,8 +79,9 @@ Every option resolves through the same chain, highest first: per-provider → pl
 | `OPENCODE_MODELS_DISCOVERY_POLL_TIMEOUT_SECONDS` | env | — | Overrides `pollTimeoutSeconds`. |
 | `OPENCODE_MODELS_DISCOVERY_PARAMETERS_PATH` | env | — | Overrides `parametersPath`. |
 | `OPENCODE_MODELS_DISCOVERY_DEFAULT_ENABLED` | env | — | Default on/off when a provider has no explicit `modelsDiscovery` flag. |
+| `OPENCODE_MODELS_DISCOVERY_STATE_FILE` | env | — | Override the state file path (see below). |
 
-Authentication per poll, in order: `apiKeyEnv` environment value → config `apiKey` (literal or `{env:VAR}`) → OpenCode credential store (`opencode auth login`). Keys are never logged; an unset `{env:VAR}` reference polls without auth and warns once.
+Authentication per poll, in order: `apiKeyEnv` environment value → config `apiKey` (literal or `{env:VAR}`) → OpenCode credential store (`opencode auth login`). Keys are never logged; an unset `{env:VAR}` reference polls without auth and warns once. One credential per provider id — multiple store keys under one provider are not unioned (see `docs/opencode-v2-plugin-credential-resolution.md`).
 
 ## What gets enriched
 
@@ -104,6 +105,32 @@ An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) 
 - Config edits apply via the config-file watch (~0.5 s debounce) or the next poll cycle.
 - Refreshes are serialized with a generation guard: a slow poll can't commit stale results over a newer one.
 
+## State file
+
+The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state}/opencode/model-discovery/state.json` so you can `cat` it to see what happened; override the path with `OPENCODE_MODELS_DISCOVERY_STATE_FILE`.
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "bifrost": {
+      "lastSuccessAt": "2026-09-09T10:00:00.000Z",
+      "lastPolledAt": "2026-09-09T10:00:00.000Z",
+      "modelCount": 248,
+      "cacheForSeconds": 86400,
+      "lastTrigger": "poll"
+    }
+  },
+  "lastRescanAt": "2026-09-09T10:05:00.000Z"
+}
+```
+
+- Written once per refresh cycle that polled any provider, after the catalog commit succeeds; the `models-discovery-rescan` command also stamps `lastRescanAt`.
+- `lastSuccessAt` is success-only: failed polls never advance it, so `cacheFor` semantics survive on disk.
+- At startup the file seeds the clocks — a provider inside its `cacheFor` TTL stays cached across restarts.
+- Atomic write (temp file + rename); file mode `0600`, directory `0700`. A write failure only warns.
+- Never stores credentials, URLs, or model ids — timestamps, counts, trigger, and TTL only.
+
 ## Limitations
 
 - opencode v2 beta line only; the runtime moves fast, so pin a commit for stability.
@@ -114,7 +141,7 @@ An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) 
 
 ```bash
 bun install
-bun test            # 78 tests
+bun test            # 91 tests
 bun run typecheck
 bun run smoke
 ```

@@ -97,6 +97,8 @@ interface ProcessLite {
   cwd(): string;
   chdir(directory: string): void;
   exit(code?: number): never;
+  /** OS process id; used only to uniquify state-file temp names. */
+  pid: number;
 }
 
 interface BunServerLite {

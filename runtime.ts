@@ -53,6 +53,14 @@ import {
   type ModelMetadata,
   type ModelVariantLite,
 } from "./metadata.ts";
+import {
+  buildStateFile,
+  loadStateFile,
+  resolveStateFilePath,
+  writeStateFile,
+  type ProviderStateInput,
+  type StateTrigger,
+} from "./state.ts";
 
 type Cleanup = CleanupLite;
 
@@ -400,7 +408,9 @@ export async function pollProvider(
     }
   }
 
-  console.log(`${LOG_PREFIX} Provider "${target.id}": ${result.length} model(s) discovered`);
+  console.log(
+    `${LOG_PREFIX} Provider "${target.id}": ${result.length} model(s) discovered [${new Date().toISOString()}]`,
+  );
   return result;
 }
 
@@ -770,6 +780,12 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       process.env.OPENCODE_MODELS_DISCOVERY_POLL_TIMEOUT_SECONDS,
     ) * 1000;
 
+  // Discovery state file: disk snapshot of clocks/counts (never credentials).
+  // Missing/corrupt/v1-mismatched file is ignored; in-memory maps stay the
+  // source of truth.
+  const statePath = resolveStateFilePath();
+  const persistedState = loadStateFile(statePath);
+
   let discovered = new Map<string, ModelEntry[]>();
   const ownedModelIds = new Map<string, Set<string>>();
   const pendingRemovals = new Map<string, Set<string>>();
@@ -788,6 +804,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       // interval retry stays eligible. Reconcile runs only here, on actual
       // poll results, so TTL-skipped providers keep their catalog state.
       lastSuccessMs.set(providerID, Date.now());
+      lastModelCounts.set(providerID, models.length);
       const previousOwned = ownedModelIds.get(providerID) ?? new Set<string>();
       const ownership = reconcileOwnedModelIds(previousOwned, models);
       queueRemovals(providerID, ownership.removed);
@@ -846,6 +863,27 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   const lastPolledMs = new Map<string, number>();
   // Last SUCCESSFUL poll per provider; the cache TTL gates on this clock.
   const lastSuccessMs = new Map<string, number>();
+  const lastModelCounts = new Map<string, number>();
+  const lastTriggers = new Map<string, StateTrigger>();
+  // Stamped on force cycles (rescan command); seeded from the file so a
+  // non-force rewrite never erases it.
+  let lastRescanAtMs: number | undefined;
+  // Seed clocks from the previous run so the cache TTL is honored across
+  // restarts (e.g. a 24h cacheFor keeps providers cached after a reboot).
+  if (persistedState !== null) {
+    for (const [providerID, entry] of Object.entries(persistedState.providers)) {
+      const successMs = Date.parse(entry.lastSuccessAt);
+      if (Number.isFinite(successMs)) lastSuccessMs.set(providerID, successMs);
+      const polledMs = Date.parse(entry.lastPolledAt);
+      if (Number.isFinite(polledMs)) lastPolledMs.set(providerID, polledMs);
+      lastModelCounts.set(providerID, entry.modelCount);
+      lastTriggers.set(providerID, entry.lastTrigger);
+    }
+    if (persistedState.lastRescanAt !== undefined) {
+      const rescanMs = Date.parse(persistedState.lastRescanAt);
+      if (Number.isFinite(rescanMs)) lastRescanAtMs = rescanMs;
+    }
+  }
 
   type RefreshMode = "normal" | "force" | "watch";
 
@@ -903,6 +941,42 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       targets = desired;
       applyPollResults(results);
       await ctx.catalog.reload();
+      // Snapshot to disk once per cycle that actually polled providers: a
+      // merged snapshot of ALL configured providers, so TTL-skipped ones
+      // keep their clocks on disk. Failures keep their previous
+      // lastSuccessMs (success-only clock); only polled providers adopt the
+      // cycle trigger, the rest preserve theirs. Force cycles (rescan
+      // command) stamp lastRescanAt, preserved across non-force writes. A
+      // disk error must never fail the refresh.
+      if (due.length > 0) {
+        try {
+          const trigger: StateTrigger = mode === "force" ? "command" : mode === "watch" ? "watch" : "poll";
+          if (mode === "force") lastRescanAtMs = Date.now();
+          const polledIds = new Set(due.map((target) => target.id));
+          const entries = new Map<string, ProviderStateInput>();
+          for (const target of targets) {
+            const successMs = lastSuccessMs.get(target.id);
+            const polledMs = lastPolledMs.get(target.id);
+            if (successMs === undefined && polledMs === undefined) continue;
+            const entryTrigger = polledIds.has(target.id)
+              ? trigger
+              : (lastTriggers.get(target.id) ?? trigger);
+            entries.set(target.id, {
+              lastSuccessMs: successMs,
+              lastPolledMs: polledMs,
+              modelCount: lastModelCounts.get(target.id) ?? 0,
+              cacheForSeconds: target.cacheForSeconds ?? globalCacheForSeconds ?? null,
+              lastTrigger: entryTrigger,
+            });
+            lastTriggers.set(target.id, entryTrigger);
+          }
+          if (entries.size > 0) {
+            writeStateFile(statePath, buildStateFile(entries, lastRescanAtMs));
+          }
+        } catch {
+          safeFailure("state-file-write", "runtime");
+        }
+      }
       return buildRefreshSummary(due, results);
     } catch {
       safeFailure("refresh", "runtime");
@@ -979,7 +1053,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               try {
                 const posted = sessionApi?.synthetic?.({
                   sessionID,
-                  text,
+                  text: `${text} [${new Date().toISOString()}]`,
                   description: "models-discovery-rescan",
                 });
                 if (posted && typeof posted.catch === "function") posted.catch(() => {});

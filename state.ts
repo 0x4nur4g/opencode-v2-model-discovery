@@ -1,0 +1,131 @@
+// Discovery state file: a disk snapshot of poll clocks/counts for `cat`-able
+// observability. In-memory maps stay the source of truth; this file only
+// seeds clocks at startup and records successful cycles. Never credentials.
+// @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+// @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
+import { homedir } from "node:os";
+// @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
+import { dirname, join, resolve } from "node:path";
+import { isRecord, LOG_PREFIX } from "./core.ts";
+
+export const STATE_FILE_ENV = "OPENCODE_MODELS_DISCOVERY_STATE_FILE";
+
+export const STATE_TRIGGERS = ["poll", "watch", "command"] as const;
+export type StateTrigger = (typeof STATE_TRIGGERS)[number];
+
+export interface ProviderStateEntry {
+  lastSuccessAt: string; // ISO
+  lastPolledAt: string; // ISO
+  modelCount: number;
+  cacheForSeconds: number | null;
+  lastTrigger: StateTrigger;
+}
+
+export interface DiscoveryStateFile {
+  version: 1;
+  providers: Record<string, ProviderStateEntry>;
+  lastRescanAt?: string;
+}
+
+export interface ProviderStateInput {
+  lastSuccessMs?: number;
+  lastPolledMs?: number;
+  modelCount: number;
+  cacheForSeconds: number | null;
+  lastTrigger: StateTrigger;
+}
+
+function warnIgnored(reason: string): void {
+  console.warn(`${LOG_PREFIX} state-file ignored (${reason}); continuing without persistence.`);
+}
+
+export function resolveStateFilePath(env: Record<string, string | undefined> = process.env): string {
+  const override = env[STATE_FILE_ENV];
+  if (override !== undefined && override.trim() !== "") return resolve(override.trim());
+  const xdgState = env.XDG_STATE_HOME;
+  const stateRoot =
+    xdgState !== undefined && xdgState.trim() !== "" ? xdgState.trim() : join(homedir(), ".local", "state");
+  return join(stateRoot, "opencode", "model-discovery", "state.json");
+}
+
+function parseEntry(value: unknown): ProviderStateEntry | null {
+  if (!isRecord(value)) return null;
+  const { lastSuccessAt, lastPolledAt, modelCount, cacheForSeconds, lastTrigger } = value;
+  if (typeof lastSuccessAt !== "string" || !Number.isFinite(Date.parse(lastSuccessAt))) return null;
+  if (typeof lastPolledAt !== "string" || !Number.isFinite(Date.parse(lastPolledAt))) return null;
+  if (typeof modelCount !== "number" || !Number.isInteger(modelCount) || modelCount < 0) return null;
+  if (!(cacheForSeconds === null || (typeof cacheForSeconds === "number" && cacheForSeconds > 0))) return null;
+  if (!STATE_TRIGGERS.includes(lastTrigger as StateTrigger)) return null;
+  return {
+    lastSuccessAt,
+    lastPolledAt,
+    modelCount,
+    cacheForSeconds,
+    lastTrigger: lastTrigger as StateTrigger,
+  };
+}
+
+export function loadStateFile(path: string): DiscoveryStateFile | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null; // ENOENT or unreadable: no state, cold start.
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    warnIgnored("unreadable");
+    return null;
+  }
+  if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.providers)) {
+    warnIgnored("unsupported-shape");
+    return null;
+  }
+  const providers: Record<string, ProviderStateEntry> = {};
+  for (const [id, entry] of Object.entries(parsed.providers)) {
+    const parsedEntry = parseEntry(entry);
+    if (parsedEntry !== null) providers[id] = parsedEntry;
+  }
+  const lastRescanAt =
+    typeof parsed.lastRescanAt === "string" && Number.isFinite(Date.parse(parsed.lastRescanAt))
+      ? parsed.lastRescanAt
+      : undefined;
+  return { version: 1, providers, ...(lastRescanAt !== undefined ? { lastRescanAt } : {}) };
+}
+
+export function buildStateFile(
+  inputs: ReadonlyMap<string, ProviderStateInput>,
+  lastRescanAtMs?: number,
+): DiscoveryStateFile {
+  const providers: Record<string, ProviderStateEntry> = {};
+  for (const [id, input] of inputs) {
+    providers[id] = {
+      lastSuccessAt: new Date(input.lastSuccessMs ?? 0).toISOString(), // epoch = never succeeded
+      lastPolledAt: new Date(input.lastPolledMs ?? 0).toISOString(),
+      modelCount: input.modelCount,
+      cacheForSeconds: input.cacheForSeconds,
+      lastTrigger: input.lastTrigger,
+    };
+  }
+  const state: DiscoveryStateFile = { version: 1, providers };
+  if (lastRescanAtMs !== undefined) state.lastRescanAt = new Date(lastRescanAtMs).toISOString();
+  return state;
+}
+
+export function writeStateFile(path: string, state: DiscoveryStateFile): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const tmpPath = `${path}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmpPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmpPath, path);
+  } finally {
+    try {
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // Best-effort cleanup; never surface raw errors.
+    }
+  }
+}

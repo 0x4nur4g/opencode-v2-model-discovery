@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -48,6 +48,13 @@ import {
   setup,
 } from "opencode-v2-model-discovery";
 import type { ModelEntry } from "opencode-v2-model-discovery";
+import {
+  STATE_FILE_ENV,
+  buildStateFile,
+  loadStateFile,
+  resolveStateFilePath,
+  writeStateFile,
+} from "./state.ts";
 
 function catalogModel(name: string, metadata: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -91,6 +98,23 @@ function catalogRecord(
     models: new Map(Object.entries(models)),
   };
 }
+
+// Per-test state-file isolation: setup() writes the discovery state file at
+// `${XDG_STATE_HOME:-~/.local/state}/opencode/model-discovery/state.json`;
+// every test pins OPENCODE_MODELS_DISCOVERY_STATE_FILE to a fresh temp path so
+// no test ever reads or writes the real user state dir.
+const isolatedStateDirs: string[] = [];
+let isolatedStatePath = "";
+beforeEach(() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-state-*"));
+  isolatedStateDirs.push(dir);
+  isolatedStatePath = path.join(dir, "opencode", "model-discovery", "state.json");
+  fs.mkdirSync(path.dirname(isolatedStatePath), { recursive: true });
+  process.env[STATE_FILE_ENV] = isolatedStatePath;
+});
+afterAll(() => {
+  for (const dir of isolatedStateDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 describe("extractEntries", () => {
   test("parses the OpenAI data response shape and skips invalid entries", () => {
@@ -1433,15 +1457,16 @@ describe("rescan triggers", () => {
 
       await registered!.execute({ sessionID: "ses_ack_test" });
       expect(acks.length).toBe(2);
-      expect(acks[0]).toEqual({
-        sessionID: "ses_ack_test",
-        text: "Models-discovery rescan started.",
-        description: "models-discovery-rescan",
-      });
-      expect(acks[1].text).toBe(
-        "Models-discovery rescan complete: 1 model(s) across 1 provider(s).",
+      // Acks carry a trailing ISO timestamp; assert the text prefix and shape.
+      expect(acks[0].sessionID).toBe("ses_ack_test");
+      expect(acks[0].description).toBe("models-discovery-rescan");
+      expect(acks[0].text).toMatch(
+        /^Models-discovery rescan started\. \[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]$/,
       );
       expect(acks[1].description).toBe("models-discovery-rescan");
+      expect(acks[1].text).toMatch(
+        /^Models-discovery rescan complete: 1 model\(s\) across 1 provider\(s\)\. \[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]$/,
+      );
 
       // Headless invocation (no sessionID) still refreshes but posts no acks.
       const fetchBefore = fetchCount;
@@ -1853,6 +1878,450 @@ describe("cacheFor success TTL", () => {
       fs.writeFileSync(configPath, "{}");
       await waitWatch();
       expect(fetchCount).toBe(2);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("state file persistence", () => {
+  /**
+   * Env/cwd isolation for setup() tests; mirrors the inline pattern used by
+   * the rescan-trigger tests above. Does not touch STATE_FILE_ENV — the
+   * module-level beforeEach pins that per test.
+   */
+  function isolateConfigEnv(dir: string): () => void {
+    const previousCwd = process.cwd();
+    const previousEnv = {
+      OPENCODE_CONFIG: process.env.OPENCODE_CONFIG,
+      OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
+      OPENCODE_CONFIG_CONTENT: process.env.OPENCODE_CONFIG_CONTENT,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      HOME: process.env.HOME,
+    };
+    const restore = (): void => {
+      process.chdir(previousCwd);
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    const configPath = path.join(dir, "explicit.json");
+    fs.writeFileSync(configPath, "{}");
+    process.env.OPENCODE_CONFIG = configPath;
+    process.env.OPENCODE_CONFIG_DIR = path.join(dir, "cfgdir");
+    process.env.XDG_CONFIG_HOME = path.join(dir, "xdg");
+    process.env.HOME = path.join(dir, "home");
+    delete process.env.OPENCODE_CONFIG_CONTENT;
+    process.chdir(dir);
+    return restore;
+  }
+
+  test("resolveStateFilePath uses XDG_STATE_HOME and defaults under home", () => {
+    const homeDefault = path.join(os.homedir(), ".local", "state", "opencode", "model-discovery", "state.json");
+    expect(resolveStateFilePath({})).toBe(homeDefault);
+    expect(resolveStateFilePath({ XDG_STATE_HOME: "/tmp/xdg-state" })).toBe(
+      "/tmp/xdg-state/opencode/model-discovery/state.json",
+    );
+    // Empty string is treated as unset.
+    expect(resolveStateFilePath({ XDG_STATE_HOME: "" })).toBe(homeDefault);
+  });
+
+  test("OPENCODE_MODELS_DISCOVERY_STATE_FILE overrides XDG_STATE_HOME", () => {
+    expect(
+      resolveStateFilePath({
+        [STATE_FILE_ENV]: "/tmp/override/state.json",
+        XDG_STATE_HOME: "/tmp/xdg",
+      }),
+    ).toBe("/tmp/override/state.json");
+    // A relative override resolves against the process cwd.
+    const relative = resolveStateFilePath({ [STATE_FILE_ENV]: "rel/state.json" });
+    expect(path.isAbsolute(relative)).toBe(true);
+    expect(relative).toBe(path.resolve("rel/state.json"));
+  });
+
+  test("loadStateFile ignores corrupt JSON and unsupported shapes without throwing", () => {
+    const warnings: string[] = [];
+    const previousWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+    try {
+      fs.writeFileSync(isolatedStatePath, "not json {{");
+      expect(loadStateFile(isolatedStatePath)).toBeNull();
+      fs.writeFileSync(isolatedStatePath, '{"version":2,"providers":{}}');
+      expect(loadStateFile(isolatedStatePath)).toBeNull();
+      fs.writeFileSync(isolatedStatePath, "null");
+      expect(loadStateFile(isolatedStatePath)).toBeNull();
+      fs.writeFileSync(isolatedStatePath, "[]");
+      expect(loadStateFile(isolatedStatePath)).toBeNull();
+      expect(warnings.length).toBeGreaterThan(0);
+      for (const warning of warnings) {
+        // Sanitized: the warn names the reason, never the raw parse error.
+        expect(warning).toContain("state-file ignored");
+        expect(warning).not.toContain("not json");
+        expect(warning).not.toContain("Unexpected");
+      }
+    } finally {
+      console.warn = previousWarn;
+    }
+  });
+
+  test("loadStateFile keeps valid entries and skips invalid ones", () => {
+    const file = {
+      version: 1,
+      providers: {
+        good: {
+          lastSuccessAt: "2026-09-01T00:00:00.000Z",
+          lastPolledAt: "2026-09-01T00:00:01.000Z",
+          modelCount: 4,
+          cacheForSeconds: null,
+          lastTrigger: "poll",
+        },
+        badDate: {
+          lastSuccessAt: "not-a-date",
+          lastPolledAt: "2026-09-01T00:00:01.000Z",
+          modelCount: 1,
+          cacheForSeconds: null,
+          lastTrigger: "poll",
+        },
+        badCount: {
+          lastSuccessAt: "2026-09-01T00:00:00.000Z",
+          lastPolledAt: "2026-09-01T00:00:01.000Z",
+          modelCount: -3,
+          cacheForSeconds: null,
+          lastTrigger: "poll",
+        },
+        badTrigger: {
+          lastSuccessAt: "2026-09-01T00:00:00.000Z",
+          lastPolledAt: "2026-09-01T00:00:01.000Z",
+          modelCount: 1,
+          cacheForSeconds: null,
+          lastTrigger: "cron",
+        },
+      },
+    };
+    fs.writeFileSync(isolatedStatePath, JSON.stringify(file));
+    const state = loadStateFile(isolatedStatePath);
+    expect(state).not.toBeNull();
+    expect(Object.keys(state!.providers)).toEqual(["good"]);
+  });
+
+  test("a failed poll never writes lastSuccessAt and state file preserves the clock", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-statefail-"));
+    const restore = isolateConfigEnv(dir);
+    const oldMs = Date.now() - 3_600_000;
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "p1",
+            { lastSuccessMs: oldMs, lastPolledMs: oldMs, modelCount: 3, cacheForSeconds: null, lastTrigger: "poll" },
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      if (fetchCount === 1) return new Response("boom", { status: 500 });
+      return new Response(JSON.stringify({ data: [{ id: "p1-m1" }, { id: "p1-m2" }] }), { status: 200 });
+    };
+    const flush = async (): Promise<void> => {
+      for (let i = 0; i < 30; i += 1) await Promise.resolve();
+    };
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }] },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      expect(fetchCount).toBe(1);
+      // The failed cycle rewrote lastPolledAt but kept the seeded success
+      // clock and model count: failures never clobber lastSuccessAt.
+      let onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.providers.p1.lastSuccessAt).toBe(new Date(oldMs).toISOString());
+      expect(onDisk.providers.p1.modelCount).toBe(3);
+
+      requestImmediateRefresh();
+      await flush();
+      expect(fetchCount).toBe(2);
+      onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(new Date(onDisk.providers.p1.lastSuccessAt).getTime()).toBeGreaterThan(oldMs);
+      expect(onDisk.providers.p1.modelCount).toBe(2);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("restart seeding honors the cache TTL (fresh success = no poll on setup)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-seedttl-"));
+    const restore = isolateConfigEnv(dir);
+    const now = Date.now();
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "p1",
+            {
+              // Interval long elapsed, but the success clock is fresh: the
+              // seeded TTL (not the interval) is what must skip this poll.
+              lastSuccessMs: now - 10_000,
+              lastPolledMs: now - 400_000,
+              modelCount: 2,
+              cacheForSeconds: 86400,
+              lastTrigger: "poll",
+            },
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    };
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }], cacheFor: 86400 },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      expect(fetchCount).toBe(0);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("restart seeding repolls when the TTL expired", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-seedexp-"));
+    const restore = isolateConfigEnv(dir);
+    const staleMs = Date.now() - 100_000 * 1000; // ~27.8h, beyond cacheFor 86400
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "p1",
+            {
+              lastSuccessMs: staleMs,
+              lastPolledMs: staleMs,
+              modelCount: 2,
+              cacheForSeconds: 86400,
+              lastTrigger: "poll",
+            },
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "seed-m" }] }), { status: 200 });
+    };
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }], cacheFor: 86400 },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      expect(fetchCount).toBeGreaterThanOrEqual(1);
+      // The expired seed was replaced by a fresh success clock on disk.
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(new Date(onDisk.providers.p1.lastSuccessAt).getTime()).toBeGreaterThan(staleMs);
+      expect(onDisk.providers.p1.lastTrigger).toBe("poll");
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("state file after a successful cycle has ISO shape and perms", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-shape-"));
+    const restore = isolateConfigEnv(dir);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ data: [{ id: "m1" }, { id: "m2" }] }), { status: 200 });
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }] },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.version).toBe(1);
+      expect(onDisk.providers.p1.lastSuccessAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+      expect(onDisk.providers.p1.lastPolledAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+      expect(onDisk.providers.p1.modelCount).toBe(2);
+      expect(onDisk.providers.p1.cacheForSeconds).toBeNull();
+      expect(onDisk.providers.p1.lastTrigger).toBe("poll");
+      expect(onDisk.lastRescanAt).toBeUndefined();
+      // 0600 on the file; the state dir is 0700.
+      expect(fs.statSync(isolatedStatePath).mode & 0o777).toBe(0o600);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rescan command stamps lastTrigger command and lastRescanAt", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-staterescan-"));
+    const restore = isolateConfigEnv(dir);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ data: [{ id: "state-m" }] }), { status: 200 });
+    let registered:
+      | { name: string; execute: (context?: { sessionID?: string }) => Promise<void> | void }
+      | undefined;
+    const context = {
+      options: { providers: [{ id: "cmdstate", baseURL: "https://cmdstate.invalid/v1" }] },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+      command: {
+        transform: async (callback: (draft: { add(command: unknown): void }) => void) => {
+          callback({
+            add: (command: unknown) => {
+              registered = command as {
+                name: string;
+                execute: (context?: { sessionID?: string }) => Promise<void> | void;
+              };
+            },
+          });
+          return { dispose: async () => {} };
+        },
+      },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          return { id: "msg_state_test" };
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // The initial cycle wrote poll-triggered state first.
+      let onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.providers.cmdstate.modelCount).toBe(1);
+      expect(onDisk.providers.cmdstate.lastTrigger).toBe("poll");
+      expect(onDisk.lastRescanAt).toBeUndefined();
+
+      await registered!.execute({ sessionID: "ses_state_test" });
+      onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(registered?.name).toBe("models-discovery-rescan");
+      expect(onDisk.providers.cmdstate.modelCount).toBe(1);
+      expect(onDisk.providers.cmdstate.lastTrigger).toBe("command");
+      expect(onDisk.lastRescanAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a mixed cycle keeps TTL-skipped providers on disk", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mixed-"));
+    const restore = isolateConfigEnv(dir);
+    const now = Date.now();
+    const cachedSuccessIso = new Date(now - 10_000).toISOString();
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "cached",
+            {
+              // Well inside the TTL: this provider must NOT be polled, and
+              // its seeded clocks/counts must survive the cycle's snapshot.
+              lastSuccessMs: now - 10_000,
+              lastPolledMs: now - 400_000,
+              modelCount: 3,
+              cacheForSeconds: 86400,
+              lastTrigger: "poll",
+            },
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    const fetched: string[] = [];
+    globalThis.fetch = async (url: unknown) => {
+      fetched.push(String(url));
+      return new Response(JSON.stringify({ data: [{ id: "fresh-m1" }, { id: "fresh-m2" }] }), { status: 200 });
+    };
+    const context = {
+      options: {
+        providers: [
+          { id: "cached", baseURL: "https://cached.invalid/v1" },
+          { id: "fresh", baseURL: "https://fresh.invalid/v1" },
+        ],
+        cacheFor: 86400,
+      },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // Only "fresh" was polled; "cached" sat inside its seeded TTL.
+      expect(fetched.length).toBe(1);
+      expect(fetched.some((url) => url.includes("cached.invalid"))).toBe(false);
+      // The snapshot merges BOTH providers: the TTL-skipped one keeps its
+      // seeded clock, trigger, and count untouched.
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(Object.keys(onDisk.providers).sort()).toEqual(["cached", "fresh"]);
+      expect(onDisk.providers.cached.lastSuccessAt).toBe(cachedSuccessIso);
+      expect(onDisk.providers.cached.lastTrigger).toBe("poll");
+      expect(onDisk.providers.cached.modelCount).toBe(3);
+      expect(onDisk.providers.fresh.modelCount).toBe(2);
       await cleanup?.();
     } finally {
       restore();
