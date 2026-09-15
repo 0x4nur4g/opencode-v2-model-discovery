@@ -231,6 +231,10 @@ function parseModalityString(value: string): { input: string[]; output: string[]
   return input && output ? { input, output } : undefined;
 }
 
+function hasToolsFeature(value: unknown): boolean {
+  return parseStringArray(value)?.includes("tools") === true;
+}
+
 function parseModalitiesCapabilities(record: Record<string, unknown>): ModelCapabilitiesLite | undefined {
   const sources: unknown[] = [record.modalities, record.architecture, record];
   for (const source of sources) {
@@ -248,7 +252,7 @@ function parseModalitiesCapabilities(record: Record<string, unknown>): ModelCapa
           ? source.tools
           : typeof record.tools === "boolean"
             ? record.tools
-            : false;
+            : hasToolsFeature(source.supported_features) || hasToolsFeature(record.supported_features);
       return { tools, input, output };
     }
     if (typeof source.modality === "string") {

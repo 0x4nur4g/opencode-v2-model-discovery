@@ -215,6 +215,40 @@ describe("extractEntries", () => {
     });
   });
 
+  test("derives tools from Baseten supported_features without inferring variants", () => {
+    const metadata = parseModelMetadata({
+      id: "deepseek-ai/DeepSeek-V4.1-Flash",
+      name: "DeepSeek V4.1 Flash",
+      input_modalities: ["text", "image"],
+      output_modalities: ["text"],
+      context_length: 1000000,
+      max_completion_tokens: 32000,
+      supported_features: ["tools", "json_mode", "structured_outputs", "reasoning", "reasoning_effort"],
+    });
+    expect(metadata).toMatchObject({
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+      limit: { context: 1000000, output: 32000 },
+    });
+    expect(metadata?.variants).toBeUndefined();
+  });
+
+  test("keeps explicit boolean tools signals ahead of supported_features", () => {
+    const recordLevel = parseModelMetadata({
+      id: "baseten/boolean-false",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      tools: false,
+      supported_features: ["tools"],
+    });
+    const sourceLevel = parseModelMetadata({
+      id: "baseten/architecture-boolean-false",
+      architecture: { input_modalities: ["text"], output_modalities: ["text"], tools: false },
+      supported_features: ["tools"],
+    });
+    expect(recordLevel?.capabilities?.tools).toBe(false);
+    expect(sourceLevel?.capabilities?.tools).toBe(false);
+  });
+
   test("returns undefined for malformed or unrecognized response bodies", () => {
     for (const body of [undefined, null, {}, { data: "not-a-list" }, { models: {} }]) {
       expect(extractEntries(body)).toBeUndefined();

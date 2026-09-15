@@ -1,2 +1,8 @@
 node_modules/
 *.log
+coverage/
+*.tsbuildinfo
+.DS_Store
+*.swp
+.opencode/
+AGENTS.md
