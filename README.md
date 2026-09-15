@@ -91,7 +91,7 @@ With `{"enrich": true}`, provider metadata maps onto opencode's catalog schema. 
 | --- | --- | --- |
 | `variants` | `reasoning.supported_efforts`, `reasoning_options`, `additional_attributes.reasoning_efforts` (CSV), explicit `variants` | Mapped to `variants[].settings.reasoningEffort`. Efforts are never inferred from a bare `reasoning: true`. |
 | `limit` | `context_length`, `max_input_tokens`, `max_output_tokens`, `max_completion_tokens` | Needs context + output from the provider; join fills the rest. |
-| `capabilities` | `modalities` / `architecture` input-output modalities, `tools` | Same per-field merge. |
+| `capabilities` | `modalities` / `architecture` input-output modalities, `tools` (boolean signal or `supported_features` "tools" token) | Same per-field merge. |
 
 An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) backfills models that still lack effort variants, one lazy per-model fetch: `reasoning_effort_levels` → variants, `max_tokens` / `max_input_tokens` / `max_output_tokens` → limit, `supported_modalities` / `supports_function_calling` → capabilities. Failures skip that model for the cycle and never block the rest of the poll.
 
@@ -111,14 +111,15 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "providers": {
     "bifrost": {
       "lastSuccessAt": "2026-09-09T10:00:00.000Z",
       "lastPolledAt": "2026-09-09T10:00:00.000Z",
       "modelCount": 248,
       "cacheForSeconds": 86400,
-      "lastTrigger": "poll"
+      "lastTrigger": "poll",
+      "models": [{ "id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash" }]
     }
   },
   "lastRescanAt": "2026-09-09T10:05:00.000Z"
@@ -128,8 +129,10 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
 - Written once per refresh cycle that polled any provider, after the catalog commit succeeds; the `models-discovery-rescan` command also stamps `lastRescanAt`.
 - `lastSuccessAt` is success-only: failed polls never advance it, so `cacheFor` semantics survive on disk.
 - At startup the file seeds the clocks — a provider inside its `cacheFor` TTL stays cached across restarts.
+- It also seeds the discovered `models` payloads. The catalog lives in the server process only (nothing persists it to disk), so without this a restart inside a TTL would skip polling *and* have nothing to upsert — providers absent from config and from the models.dev registry would show zero models until the TTL expired. Rehydrated models re-apply through the same catalog transform, with no network call.
 - Atomic write (temp file + rename); file mode `0600`, directory `0700`. A write failure only warns.
-- Never stores credentials, URLs, or model ids — timestamps, counts, trigger, and TTL only.
+- Never stores credentials or URLs — timestamps, counts, trigger, TTL, and the discovered model payloads (ids, names, enrichment metadata) only.
+- A `version: 1` file (clocks only) is ignored: the upgrade path is one cold-start poll cycle, which rewrites it as `version: 2`.
 
 ## Limitations
 
@@ -141,7 +144,7 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
 
 ```bash
 bun install
-bun test            # 91 tests
+bun test            # 94 tests
 bun run typecheck
 bun run smoke
 ```

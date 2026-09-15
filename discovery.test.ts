@@ -1985,7 +1985,11 @@ describe("state file persistence", () => {
     try {
       fs.writeFileSync(isolatedStatePath, "not json {{");
       expect(loadStateFile(isolatedStatePath)).toBeNull();
-      fs.writeFileSync(isolatedStatePath, '{"version":2,"providers":{}}');
+      fs.writeFileSync(isolatedStatePath, '{"version":99,"providers":{}}');
+      expect(loadStateFile(isolatedStatePath)).toBeNull();
+      // A legacy v1 file (clocks only, no model payloads) is ignored: the
+      // upgrade path is a cold start, which repolls once and rewrites as v2.
+      fs.writeFileSync(isolatedStatePath, '{"version":1,"providers":{}}');
       expect(loadStateFile(isolatedStatePath)).toBeNull();
       fs.writeFileSync(isolatedStatePath, "null");
       expect(loadStateFile(isolatedStatePath)).toBeNull();
@@ -2005,7 +2009,7 @@ describe("state file persistence", () => {
 
   test("loadStateFile keeps valid entries and skips invalid ones", () => {
     const file = {
-      version: 1,
+      version: 2,
       providers: {
         good: {
           lastSuccessAt: "2026-09-01T00:00:00.000Z",
@@ -2151,6 +2155,100 @@ describe("state file persistence", () => {
     }
   });
 
+  test("restart rehydrates persisted models into the catalog without polling", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-rehydrate-"));
+    const restore = isolateConfigEnv(dir);
+    const now = Date.now();
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "p1",
+            {
+              // Fresh success clock: the boot cycle must skip the network ...
+              lastSuccessMs: now - 10_000,
+              lastPolledMs: now - 10_000,
+              modelCount: 2,
+              cacheForSeconds: 86400,
+              lastTrigger: "poll",
+              // ... and still repopulate the process-local catalog from disk.
+              models: [
+                { id: "seed-a", name: "Seed A" },
+                {
+                  id: "seed-b",
+                  name: "Seed B",
+                  enrich: true as const,
+                  metadata: {
+                    capabilities: { tools: true, input: ["text"], output: ["text"] },
+                    limit: { context: 1000, output: 50 },
+                    variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
+                  },
+                },
+              ],
+            },
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    };
+    const applied: Array<{ providerID: string; modelID: string; model: any }> = [];
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (providerID: string, modelID: string, update: (model: any) => void) => {
+          const model: any = {};
+          update(model);
+          applied.push({ providerID, modelID, model });
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }], cacheFor: 86400 },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          registered?.(draft);
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // TTL honored: the boot cycle touches no network ...
+      expect(fetchCount).toBe(0);
+      // ... yet the rehydrated payloads still reach the catalog transform.
+      expect(applied.map((entry) => entry.modelID).sort()).toEqual(["seed-a", "seed-b"]);
+      expect(applied.every((entry) => entry.providerID === "p1")).toBe(true);
+      const seedB = applied.find((entry) => entry.modelID === "seed-b");
+      expect(seedB?.model.name).toBe("Seed B");
+      expect(seedB?.model.limit).toEqual({ context: 1000, output: 50 });
+      expect(seedB?.model.variants).toEqual([{ id: "high", settings: { reasoningEffort: "high" } }]);
+      // A TTL-skipped boot cycle never rewrites the state file.
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.providers.p1.models.map((entry: any) => entry.id)).toEqual(["seed-a", "seed-b"]);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("restart seeding repolls when the TTL expired", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-seedexp-"));
     const restore = isolateConfigEnv(dir);
@@ -2221,12 +2319,14 @@ describe("state file persistence", () => {
     try {
       const cleanup = await setup(context);
       const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
-      expect(onDisk.version).toBe(1);
+      expect(onDisk.version).toBe(2);
       expect(onDisk.providers.p1.lastSuccessAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
       expect(onDisk.providers.p1.lastPolledAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
       expect(onDisk.providers.p1.modelCount).toBe(2);
       expect(onDisk.providers.p1.cacheForSeconds).toBeNull();
       expect(onDisk.providers.p1.lastTrigger).toBe("poll");
+      // Discovered payloads persist so a restart inside a TTL can rehydrate.
+      expect(onDisk.providers.p1.models.map((entry: any) => entry.id)).toEqual(["m1", "m2"]);
       expect(onDisk.lastRescanAt).toBeUndefined();
       // 0600 on the file; the state dir is 0700.
       expect(fs.statSync(isolatedStatePath).mode & 0o777).toBe(0o600);

@@ -1,6 +1,11 @@
 // Discovery state file: a disk snapshot of poll clocks/counts for `cat`-able
-// observability. In-memory maps stay the source of truth; this file only
-// seeds clocks at startup and records successful cycles. Never credentials.
+// observability, plus the last discovered model payloads so a restart inside a
+// provider's cache TTL can repopulate the catalog without polling. The catalog
+// is process-local (verified on opencode v2.0.3: no model/catalog table on disk,
+// kv holds only the models.dev registry), so clocks alone cannot survive a
+// restart — the models must. In-memory maps stay the source of truth; this file
+// seeds clocks + models at startup and records successful cycles. Never
+// credentials.
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
@@ -8,8 +13,12 @@ import { homedir } from "node:os";
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
 import { dirname, join, resolve } from "node:path";
 import { isRecord, LOG_PREFIX } from "./core.ts";
+import { parseModelMetadata } from "./metadata.ts";
+import type { ModelEntry } from "./metadata.ts";
 
 export const STATE_FILE_ENV = "OPENCODE_MODELS_DISCOVERY_STATE_FILE";
+
+export const STATE_FILE_VERSION = 2;
 
 export const STATE_TRIGGERS = ["poll", "watch", "command"] as const;
 export type StateTrigger = (typeof STATE_TRIGGERS)[number];
@@ -20,10 +29,12 @@ export interface ProviderStateEntry {
   modelCount: number;
   cacheForSeconds: number | null;
   lastTrigger: StateTrigger;
+  /** Last discovered payloads; absent/empty means nothing to rehydrate. */
+  models?: ModelEntry[];
 }
 
 export interface DiscoveryStateFile {
-  version: 1;
+  version: 2;
   providers: Record<string, ProviderStateEntry>;
   lastRescanAt?: string;
 }
@@ -34,6 +45,7 @@ export interface ProviderStateInput {
   modelCount: number;
   cacheForSeconds: number | null;
   lastTrigger: StateTrigger;
+  models?: readonly ModelEntry[];
 }
 
 function warnIgnored(reason: string): void {
@@ -49,6 +61,30 @@ export function resolveStateFilePath(env: Record<string, string | undefined> = p
   return join(stateRoot, "opencode", "model-discovery", "state.json");
 }
 
+/**
+ * Validate persisted model payloads before they can reach the catalog: ids must
+ * be non-empty strings, names optional, and metadata must survive the same
+ * parser the live path uses, so a hand-edited or truncated file can never inject
+ * an invalid capabilities/limit/variants shape.
+ */
+function parseModels(value: unknown): ModelEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parsed: ModelEntry[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    if (typeof item.id !== "string" || item.id.trim() === "") continue;
+    const name = typeof item.name === "string" && item.name !== "" ? item.name : undefined;
+    const metadata = parseModelMetadata(item.metadata);
+    parsed.push({
+      id: item.id,
+      ...(name !== undefined ? { name } : {}),
+      ...(item.enrich === true ? { enrich: true as const } : {}),
+      ...(metadata !== undefined ? { metadata } : {}),
+    });
+  }
+  return parsed.length > 0 ? parsed : undefined;
+}
+
 function parseEntry(value: unknown): ProviderStateEntry | null {
   if (!isRecord(value)) return null;
   const { lastSuccessAt, lastPolledAt, modelCount, cacheForSeconds, lastTrigger } = value;
@@ -57,12 +93,14 @@ function parseEntry(value: unknown): ProviderStateEntry | null {
   if (typeof modelCount !== "number" || !Number.isInteger(modelCount) || modelCount < 0) return null;
   if (!(cacheForSeconds === null || (typeof cacheForSeconds === "number" && cacheForSeconds > 0))) return null;
   if (!STATE_TRIGGERS.includes(lastTrigger as StateTrigger)) return null;
+  const models = parseModels(value.models);
   return {
     lastSuccessAt,
     lastPolledAt,
     modelCount,
     cacheForSeconds,
     lastTrigger: lastTrigger as StateTrigger,
+    ...(models !== undefined ? { models } : {}),
   };
 }
 
@@ -80,7 +118,7 @@ export function loadStateFile(path: string): DiscoveryStateFile | null {
     warnIgnored("unreadable");
     return null;
   }
-  if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.providers)) {
+  if (!isRecord(parsed) || parsed.version !== STATE_FILE_VERSION || !isRecord(parsed.providers)) {
     warnIgnored("unsupported-shape");
     return null;
   }
@@ -93,7 +131,11 @@ export function loadStateFile(path: string): DiscoveryStateFile | null {
     typeof parsed.lastRescanAt === "string" && Number.isFinite(Date.parse(parsed.lastRescanAt))
       ? parsed.lastRescanAt
       : undefined;
-  return { version: 1, providers, ...(lastRescanAt !== undefined ? { lastRescanAt } : {}) };
+  return {
+    version: STATE_FILE_VERSION,
+    providers,
+    ...(lastRescanAt !== undefined ? { lastRescanAt } : {}),
+  };
 }
 
 export function buildStateFile(
@@ -102,15 +144,17 @@ export function buildStateFile(
 ): DiscoveryStateFile {
   const providers: Record<string, ProviderStateEntry> = {};
   for (const [id, input] of inputs) {
+    const models = input.models;
     providers[id] = {
       lastSuccessAt: new Date(input.lastSuccessMs ?? 0).toISOString(), // epoch = never succeeded
       lastPolledAt: new Date(input.lastPolledMs ?? 0).toISOString(),
       modelCount: input.modelCount,
       cacheForSeconds: input.cacheForSeconds,
       lastTrigger: input.lastTrigger,
+      ...(models !== undefined && models.length > 0 ? { models: [...models] } : {}),
     };
   }
-  const state: DiscoveryStateFile = { version: 1, providers };
+  const state: DiscoveryStateFile = { version: STATE_FILE_VERSION, providers };
   if (lastRescanAtMs !== undefined) state.lastRescanAt = new Date(lastRescanAtMs).toISOString();
   return state;
 }

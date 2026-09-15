@@ -869,7 +869,12 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   // non-force rewrite never erases it.
   let lastRescanAtMs: number | undefined;
   // Seed clocks from the previous run so the cache TTL is honored across
-  // restarts (e.g. a 24h cacheFor keeps providers cached after a reboot).
+  // restarts (e.g. a 24h cacheFor keeps providers cached after a reboot), and
+  // seed the discovered payloads alongside them: the catalog is process-local,
+  // so a TTL-skipped boot cycle with an empty `discovered` map would upsert
+  // nothing and leave registry-absent providers with zero models until the TTL
+  // expires. Rehydrated entries re-apply through the same transform, so the
+  // ownership/clobber guard still recomputes against the live catalog.
   if (persistedState !== null) {
     for (const [providerID, entry] of Object.entries(persistedState.providers)) {
       const successMs = Date.parse(entry.lastSuccessAt);
@@ -878,6 +883,9 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       if (Number.isFinite(polledMs)) lastPolledMs.set(providerID, polledMs);
       lastModelCounts.set(providerID, entry.modelCount);
       lastTriggers.set(providerID, entry.lastTrigger);
+      if (entry.models !== undefined && entry.models.length > 0) {
+        discovered.set(providerID, entry.models);
+      }
     }
     if (persistedState.lastRescanAt !== undefined) {
       const rescanMs = Date.parse(persistedState.lastRescanAt);
@@ -967,6 +975,9 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               modelCount: lastModelCounts.get(target.id) ?? 0,
               cacheForSeconds: target.cacheForSeconds ?? globalCacheForSeconds ?? null,
               lastTrigger: entryTrigger,
+              // Persist the payloads too: the catalog is process-local, so a
+              // restart inside the TTL rehydrates from here instead of polling.
+              models: discovered.get(target.id),
             });
             lastTriggers.set(target.id, entryTrigger);
           }
