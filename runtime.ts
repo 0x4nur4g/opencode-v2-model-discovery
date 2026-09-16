@@ -11,6 +11,7 @@ import {
   POLL_TIMEOUT_MS,
   TICK_MS,
   createWarnState,
+  errorName,
   isRecord,
   isTruthyEnv,
   safeFailure,
@@ -74,6 +75,73 @@ interface CatalogProviderDraftLite {
   provider: {
     list(): readonly CatalogProviderRecordLite[];
   };
+}
+
+/** Resolved catalog write surface: one build spans the legacy and split APIs. */
+interface CatalogSurface {
+  /** Which host surface won: "model" (v2.0.4+ split) or "catalog" (legacy). */
+  readonly kind: "model" | "catalog";
+  transform(body: (draft: CatalogDraftLite) => void): Promise<CatalogRegistrationLite>;
+  reload(): Promise<void>;
+}
+
+/**
+ * Adapt a v2.0.4+ model-namespace draft to the legacy CatalogDraftLite shape
+ * the transform body is written against: the model methods live on the draft
+ * itself there, with the provider namespace under `draft.provider`.
+ */
+function adaptModelDraft(draft: unknown): CatalogDraftLite {
+  if (!isRecord(draft)) throw new Error("empty-draft");
+  const model = {
+    get: (providerID: string, modelID: string) =>
+      (draft as CatalogDraftLite["model"]).get?.(providerID, modelID),
+    update: (providerID: string, modelID: string, update: (model: ModelInfoLite) => void) =>
+      (draft as CatalogDraftLite["model"]).update(providerID, modelID, update),
+    remove: (providerID: string, modelID: string) =>
+      (draft as CatalogDraftLite["model"]).remove?.(providerID, modelID),
+  };
+  const provider = isRecord(draft.provider) ? draft.provider : undefined;
+  return {
+    model: model as CatalogDraftLite["model"],
+    ...(provider !== undefined
+      ? { provider: provider as NonNullable<CatalogDraftLite["provider"]> }
+      : {}),
+  };
+}
+
+/**
+ * Resolve the catalog write surface, newest first: v2.0.4+ `ctx.model`
+ * (verified live on 2.0.4 — `ctx.catalog` is undefined there), then the legacy
+ * `ctx.catalog` (beta line through v2.0.3). Undefined means poll-only mode:
+ * discovery, state snapshots, and the rescan command keep working, but nothing
+ * can reach the catalog until a known surface appears.
+ */
+export function resolveCatalogSurface(ctx: PluginContextLite | undefined): CatalogSurface | undefined {
+  const model = ctx?.model;
+  if (typeof model?.transform === "function") {
+    const transform = model.transform.bind(model);
+    const reload = model.reload?.bind(model);
+    return {
+      kind: "model",
+      transform: (body) => transform((draft) => body(adaptModelDraft(draft))),
+      reload: async () => {
+        if (reload !== undefined) await reload();
+      },
+    };
+  }
+  const catalog = ctx?.catalog;
+  if (typeof catalog?.transform === "function") {
+    const transform = catalog.transform.bind(catalog);
+    const reload = catalog.reload?.bind(catalog);
+    return {
+      kind: "catalog",
+      transform: (body) => transform(body),
+      reload: async () => {
+        if (reload !== undefined) await reload();
+      },
+    };
+  }
+  return undefined;
 }
 
 function runtimeConfigSources(): ConfigSource[] {
@@ -818,9 +886,16 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     }
   };
 
-  let catalogRegistration: CatalogRegistrationLite;
-  try {
-    catalogRegistration = await ctx.catalog.transform((draft) => {
+  let catalogRegistration: CatalogRegistrationLite | undefined;
+  const catalogSurface = resolveCatalogSurface(ctx);
+  if (catalogSurface === undefined) {
+    // Poll-only degradation: without a known catalog surface nothing can be
+    // upserted, but discovery, state snapshots, and the rescan command stay
+    // live so a future runtime (or a restarted one) recovers with warm clocks.
+    console.warn(`${LOG_PREFIX} no catalog surface (ctx.model/ctx.catalog); polling only.`);
+  } else {
+    try {
+      catalogRegistration = await catalogSurface.transform((draft) => {
       for (const [providerID, models] of discovered) {
         const owned = ownedModelIds.get(providerID) ?? new Set<string>();
         for (const model of models) {
@@ -852,10 +927,18 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         }
       }
       pendingRemovals.clear();
-    });
-  } catch {
-    safeFailure("catalog-transform-registration", "runtime");
-    return;
+      });
+    } catch (err) {
+      // Degrade, don't abort: a moved host surface must never again silently
+      // kill polling, state snapshots, and the rescan command. The error NAME
+      // (never message/stack) keeps the sanitized-logs rule while saying
+      // whether the surface moved (TypeError) or rejected us (SchemaError).
+      safeFailure("catalog-transform-registration", "runtime");
+      console.warn(
+        `${LOG_PREFIX} catalog surface "${catalogSurface.kind}" unusable (error=${errorName(err)}); polling only.`,
+      );
+      catalogRegistration = undefined;
+    }
   }
 
   let latestGeneration = 0;
@@ -948,7 +1031,15 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       }
       targets = desired;
       applyPollResults(results);
-      await ctx.catalog.reload();
+      // Re-fire the catalog transform so the fresh closure map commits. No
+      // surface means poll-only mode: clocks and snapshots still advance.
+      if (catalogRegistration !== undefined && catalogSurface !== undefined) {
+        try {
+          await catalogSurface.reload();
+        } catch {
+          safeFailure("catalog-reload", "runtime");
+        }
+      }
       // Snapshot to disk once per cycle that actually polled providers: a
       // merged snapshot of ALL configured providers, so TTL-skipped ones
       // keep their clocks on disk. Failures keep their previous
@@ -1094,10 +1185,12 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     clearInterval(pollInterval);
     configWatch.dispose();
     if (immediateRefreshHook === forceRefresh) immediateRefreshHook = undefined;
-    try {
-      await catalogRegistration.dispose();
-    } catch {
-      safeFailure("catalog-transform-disposal", "runtime");
+    if (catalogRegistration !== undefined) {
+      try {
+        await catalogRegistration.dispose();
+      } catch {
+        safeFailure("catalog-transform-disposal", "runtime");
+      }
     }
     if (commandRegistration !== undefined) {
       try {

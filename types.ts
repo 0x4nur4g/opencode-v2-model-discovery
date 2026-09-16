@@ -16,6 +16,19 @@ interface CatalogDraftLite {
     update(providerID: string, modelID: string, update: (model: ModelInfoLite) => void): void;
     remove(providerID: string, modelID: string): void;
   };
+  provider?: {
+    list(): readonly unknown[];
+  };
+}
+
+/** v2.0.4+ model-namespace draft: the model methods live on the draft itself. */
+interface ModelNamespaceDraftLite {
+  get(providerID: string, modelID: string): ModelInfoLite | undefined;
+  update(providerID: string, modelID: string, update: (model: ModelInfoLite) => void): void;
+  remove(providerID: string, modelID: string): void;
+  provider?: {
+    list(): readonly unknown[];
+  };
 }
 
 interface CommandContextLite {
@@ -41,9 +54,24 @@ interface CommandTransformApiLite {
 
 interface PluginContextLite {
   options: Readonly<Record<string, unknown>>;
-  catalog: {
+  /**
+   * Pre-2.0.4 catalog surface (beta line through v2.0.3): a single transform
+   * whose draft exposes both `model` and `provider` namespaces. Absent on
+   * runtimes that moved to the split surface below.
+   */
+  catalog?: {
     transform(callback: (draft: CatalogDraftLite) => void): Promise<CatalogRegistrationLite>;
-    reload(): Promise<void>;
+    reload?(): Promise<void>;
+  };
+  /**
+   * v2.0.4+ split surface: `ctx.model.transform` receives the model namespace
+   * itself as the draft (get/update/remove/default, plus a `provider` key for
+   * join reads); `ctx.provider.transform` owns provider records. Verified live
+   * on v2.0.4 (2026-09-16): `ctx.catalog` is undefined there.
+   */
+  model?: {
+    transform(callback: (draft: ModelNamespaceDraftLite) => void): Promise<CatalogRegistrationLite>;
+    reload?(): Promise<void>;
   };
   /** OpenCode integration store; absent in mocks and older runtimes. */
   integration?: IntegrationApiLite;

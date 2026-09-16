@@ -136,7 +136,11 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
 
 ## Limitations
 
-- opencode v2 beta line only; the runtime moves fast, so pin a commit for stability.
+- opencode v2 line only (beta through stable 2.x); one build spans them via
+  dual-surface catalog resolution — `ctx.model.transform` (v2.0.4+ split) with
+  fallback to `ctx.catalog.transform` (beta → v2.0.3). A runtime that removes
+  both surfaces degrades to poll-only mode (discovery + state + rescan keep
+  running) with a loud warn, never a silent abort. Pin a commit for stability.
 - Enrichment quality depends on the provider — bare `/models` listings fall back to name-only catalog enrichment.
 - `parametersPath` endpoints (e.g. Bifrost's `/api/models/parameters`) are management endpoints and may be RBAC-protected; without permission models keep join/name-only enrichment.
 
@@ -144,7 +148,7 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
 
 ```bash
 bun install
-bun test            # 94 tests
+bun test            # 100 tests
 bun run typecheck
 bun run smoke
 ```

@@ -82,6 +82,21 @@ export function safeFailure(operation: string, marker: string, status?: number):
   );
 }
 
+/**
+ * Error constructor name for diagnostics (TypeError, SchemaError, ...).
+ * Name only — message/stack are never logged, so raw error text (which could
+ * carry URLs, keys, or response bodies) can never reach the logs. Keeps the
+ * sanitized-logs rule intact while still distinguishing "host surface moved"
+ * (TypeError) from "host rejected our payload" (SchemaError-class).
+ */
+export function errorName(err: unknown): string {
+  if (typeof err === "object" && err !== null) {
+    const name = (err as { name?: unknown }).name;
+    if (typeof name === "string" && name.length > 0 && name.length <= 64) return name;
+  }
+  return "unknown";
+}
+
 export function isTruthyEnv(value: string | undefined): boolean {
   return value === "1" || value?.trim().toLowerCase() === "true";
 }

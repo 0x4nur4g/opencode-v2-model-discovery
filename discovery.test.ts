@@ -16,6 +16,7 @@ import {
   createStoreAuthResolver,
   discoveredModelName,
   entryMatches,
+  errorName,
   extractEntries,
   formatRescanAck,
   mergeProviderConfigs,
@@ -36,6 +37,7 @@ import {
   resetWarnedWatchPaths,
   retainLastGood,
   resolveCacheForSeconds,
+  resolveCatalogSurface,
   resolveConfigPaths,
   resolveConfigSources,
   resolveIntegrationCredential,
@@ -2908,6 +2910,159 @@ describe("parameters path enrichment", () => {
     } finally {
       finish.restore();
       resetWarnedParametersKeys();
+    }
+  });
+});
+
+describe("catalog surface resolution (legacy catalog vs v2.0.4+ model split)", () => {
+  test("prefers ctx.model when both surfaces exist", async () => {
+    const seen: Array<string> = [];
+    const surface = resolveCatalogSurface({
+      options: {},
+      catalog: {
+        transform: async () => {
+          seen.push("catalog");
+          return { dispose: async () => {} };
+        },
+      },
+      model: {
+        transform: async (callback: (draft: unknown) => void) => {
+          seen.push("model");
+          callback({ get: () => undefined, update: () => {}, remove: () => {} });
+          return { dispose: async () => {} };
+        },
+      },
+    } as any);
+    expect(surface?.kind).toBe("model");
+    await surface?.transform(() => {});
+    expect(seen).toEqual(["model"]);
+  });
+
+  test("falls back to ctx.catalog on pre-2.0.4 runtimes", async () => {
+    const surface = resolveCatalogSurface({
+      options: {},
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+    } as any);
+    expect(surface?.kind).toBe("catalog");
+    await surface?.transform(() => {});
+    await surface?.reload();
+  });
+
+  test("returns undefined when neither surface exists", () => {
+    expect(resolveCatalogSurface({ options: {} } as any)).toBeUndefined();
+    expect(resolveCatalogSurface(undefined)).toBeUndefined();
+  });
+
+  test("model-surface draft adapts to update/get/remove calls", async () => {
+    const calls: Array<{ op: string; providerID: string; modelID: string }> = [];
+    const store = new Map<string, any>();
+    const surface = resolveCatalogSurface({
+      options: {},
+      // v2.0.4 shape: the draft IS the model namespace (no .model nesting).
+      model: {
+        transform: async (callback: (draft: unknown) => void) => {
+          callback({
+            get: (providerID: string, modelID: string) => {
+              calls.push({ op: "get", providerID, modelID });
+              return store.get(`${providerID}/${modelID}`);
+            },
+            update: (providerID: string, modelID: string, update: (model: any) => void) => {
+              calls.push({ op: "update", providerID, modelID });
+              const model = store.get(`${providerID}/${modelID}`) ?? {};
+              update(model);
+              store.set(`${providerID}/${modelID}`, model);
+            },
+            remove: (providerID: string, modelID: string) => {
+              calls.push({ op: "remove", providerID, modelID });
+              store.delete(`${providerID}/${modelID}`);
+            },
+            provider: { list: () => [] },
+          });
+          return { dispose: async () => {} };
+        },
+      },
+    } as any);
+    await surface?.transform((draft) => {
+      // Legacy-shaped body, as written in setupInternal and applyDiscovered.
+      expect(draft.model.get("p", "m")).toBeUndefined();
+      draft.model.update("p", "m", (model: any) => {
+        model.name = "Adapted";
+      });
+      expect(draft.model.get("p", "m")).toEqual({ name: "Adapted" });
+      draft.model.remove("p", "m");
+      expect(draft.model.get("p", "m")).toBeUndefined();
+    });
+    expect(calls.map((call) => call.op)).toEqual(["get", "update", "get", "remove", "get"]);
+  });
+
+  test("errorName reports constructor names without raw text", () => {
+    expect(errorName(new TypeError("secret-url https://x invalid key abc"))).toBe("TypeError");
+    expect(errorName(new Error("boom"))).toBe("Error");
+    expect(errorName(undefined)).toBe("unknown");
+    expect(errorName(null)).toBe("unknown");
+    expect(errorName("plain")).toBe("unknown");
+  });
+
+  test("setup without any catalog surface still polls, snapshots, and warns", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-nosurface-"));
+    const restoreIsolation = (() => {
+      const previousCwd = process.cwd();
+      const previousEnv = {
+        OPENCODE_CONFIG: process.env.OPENCODE_CONFIG,
+        OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
+        OPENCODE_CONFIG_CONTENT: process.env.OPENCODE_CONFIG_CONTENT,
+        XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+        HOME: process.env.HOME,
+      };
+      const restore = (): void => {
+        process.chdir(previousCwd);
+        for (const [key, value] of Object.entries(previousEnv)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      };
+      const configPath = path.join(dir, "explicit.json");
+      fs.writeFileSync(configPath, "{}");
+      process.env.OPENCODE_CONFIG = configPath;
+      process.env.OPENCODE_CONFIG_DIR = path.join(dir, "cfgdir");
+      process.env.XDG_CONFIG_HOME = path.join(dir, "xdg");
+      process.env.HOME = path.join(dir, "home");
+      delete process.env.OPENCODE_CONFIG_CONTENT;
+      process.chdir(dir);
+      return restore;
+    })();
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "m1" }] }), { status: 200 });
+    };
+    const warnings: string[] = [];
+    const previousWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }] },
+      // No catalog surface at all: setup must degrade, not abort.
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // Polling still ran (fetch hit) and the v2 snapshot still persisted payloads.
+      expect(fetchCount).toBeGreaterThanOrEqual(1);
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.providers.p1.models.map((entry: any) => entry.id)).toEqual(["m1"]);
+      expect(warnings.some((warning) => warning.includes("no catalog surface"))).toBe(true);
+      await cleanup?.();
+    } finally {
+      console.warn = previousWarn;
+      restoreIsolation();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
