@@ -63,6 +63,7 @@ export {
   resolveCatalogSurface,
   resolveIntegrationCredential,
   setImmediateRefreshHook,
+  setModelsDevRegistryForTests,
   setup,
 } from "./runtime.ts";
 export type { AutoTargetMessage } from "./core.ts";

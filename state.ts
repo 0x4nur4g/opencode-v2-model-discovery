@@ -31,6 +31,8 @@ export interface ProviderStateEntry {
   lastTrigger: StateTrigger;
   /** Last discovered payloads; absent/empty means nothing to rehydrate. */
   models?: ModelEntry[];
+  /** Catalog row ids whose metadata this plugin merged; re-applied on restart. */
+  mergedModelIds?: string[];
 }
 
 export interface DiscoveryStateFile {
@@ -46,6 +48,7 @@ export interface ProviderStateInput {
   cacheForSeconds: number | null;
   lastTrigger: StateTrigger;
   models?: readonly ModelEntry[];
+  mergedModelIds?: readonly string[];
 }
 
 function warnIgnored(reason: string): void {
@@ -85,6 +88,13 @@ function parseModels(value: unknown): ModelEntry[] | undefined {
   return parsed.length > 0 ? parsed : undefined;
 }
 
+/** Tolerant parse of the merged-model id list: absent or malformed reads as none. */
+function parseMergedModelIds(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids = value.filter((id): id is string => typeof id === "string" && id.trim() !== "");
+  return ids.length > 0 ? ids : undefined;
+}
+
 function parseEntry(value: unknown): ProviderStateEntry | null {
   if (!isRecord(value)) return null;
   const { lastSuccessAt, lastPolledAt, modelCount, cacheForSeconds, lastTrigger } = value;
@@ -94,6 +104,7 @@ function parseEntry(value: unknown): ProviderStateEntry | null {
   if (!(cacheForSeconds === null || (typeof cacheForSeconds === "number" && cacheForSeconds > 0))) return null;
   if (!STATE_TRIGGERS.includes(lastTrigger as StateTrigger)) return null;
   const models = parseModels(value.models);
+  const mergedModelIds = parseMergedModelIds(value.mergedModelIds);
   return {
     lastSuccessAt,
     lastPolledAt,
@@ -101,6 +112,7 @@ function parseEntry(value: unknown): ProviderStateEntry | null {
     cacheForSeconds,
     lastTrigger: lastTrigger as StateTrigger,
     ...(models !== undefined ? { models } : {}),
+    ...(mergedModelIds !== undefined ? { mergedModelIds } : {}),
   };
 }
 
@@ -152,6 +164,9 @@ export function buildStateFile(
       cacheForSeconds: input.cacheForSeconds,
       lastTrigger: input.lastTrigger,
       ...(models !== undefined && models.length > 0 ? { models: [...models] } : {}),
+      ...(input.mergedModelIds !== undefined && input.mergedModelIds.length > 0
+        ? { mergedModelIds: [...input.mergedModelIds] }
+        : {}),
     };
   }
   const state: DiscoveryStateFile = { version: STATE_FILE_VERSION, providers };
@@ -172,4 +187,21 @@ export function writeStateFile(path: string, state: DiscoveryStateFile): void {
       // Best-effort cleanup; never surface raw errors.
     }
   }
+}
+
+/** Merged-model ids recorded for a provider; absent or malformed reads as empty. */
+export function mergedModelIdsFor(state: DiscoveryStateFile, providerID: string): string[] {
+  const ids = state.providers[providerID]?.mergedModelIds;
+  return Array.isArray(ids) ? [...ids] : [];
+}
+
+/** Pure setter: attach merged-model ids to a provider input for the next state write. */
+export function withMergedModelIds(
+  input: ProviderStateInput,
+  modelIDs: readonly string[],
+): ProviderStateInput {
+  const next: ProviderStateInput = { ...input };
+  if (modelIDs.length > 0) next.mergedModelIds = [...modelIDs];
+  else delete next.mergedModelIds;
+  return next;
 }

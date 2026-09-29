@@ -47,14 +47,19 @@ import {
   resolvePollTimeoutSeconds,
   selectAutoTargets,
   setImmediateRefreshHook,
+  setModelsDevRegistryForTests,
   setup,
 } from "opencode-v2-model-discovery";
 import type { ModelEntry } from "opencode-v2-model-discovery";
+import { applyMetadataGapFill, registryJoinVariants } from "./metadata.ts";
+import { formatMergeAck } from "./runtime.ts";
 import {
   STATE_FILE_ENV,
   buildStateFile,
   loadStateFile,
+  mergedModelIdsFor,
   resolveStateFilePath,
+  withMergedModelIds,
   writeStateFile,
 } from "./state.ts";
 
@@ -113,6 +118,7 @@ beforeEach(() => {
   isolatedStatePath = path.join(dir, "opencode", "model-discovery", "state.json");
   fs.mkdirSync(path.dirname(isolatedStatePath), { recursive: true });
   process.env[STATE_FILE_ENV] = isolatedStatePath;
+  setModelsDevRegistryForTests(new Map());
 });
 afterAll(() => {
   for (const dir of isolatedStateDirs) fs.rmSync(dir, { recursive: true, force: true });
@@ -1469,10 +1475,13 @@ describe("rescan triggers", () => {
         transform: async (callback: (draft: { add(command: unknown): void }) => void) => {
           callback({
             add: (command: unknown) => {
-              registered = command as {
+              const candidate = command as {
                 name: string;
                 execute: (context?: { sessionID?: string }) => Promise<void> | void;
               };
+              // The transform now registers a second command; these tests
+              // exercise the rescan command specifically.
+              if (candidate.name === "models-discovery-rescan") registered = candidate;
             },
           });
           return { dispose: async () => {} };
@@ -2362,10 +2371,13 @@ describe("state file persistence", () => {
         transform: async (callback: (draft: { add(command: unknown): void }) => void) => {
           callback({
             add: (command: unknown) => {
-              registered = command as {
+              const candidate = command as {
                 name: string;
                 execute: (context?: { sessionID?: string }) => Promise<void> | void;
               };
+              // The transform now registers a second command; these tests
+              // exercise the rescan command specifically.
+              if (candidate.name === "models-discovery-rescan") registered = candidate;
             },
           });
           return { dispose: async () => {} };
@@ -2465,6 +2477,1109 @@ describe("state file persistence", () => {
       (globalThis as any).setInterval = previousSetInterval;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("merge gap-fill and merge command", () => {
+  /**
+   * Env/cwd isolation for setup() tests; mirrors the state-file suite helper.
+   * STATE_FILE_ENV stays pinned by the module-level beforeEach.
+   */
+  function isolateConfigEnv(dir: string): () => void {
+    const previousCwd = process.cwd();
+    const previousEnv = {
+      OPENCODE_CONFIG: process.env.OPENCODE_CONFIG,
+      OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
+      OPENCODE_CONFIG_CONTENT: process.env.OPENCODE_CONFIG_CONTENT,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      HOME: process.env.HOME,
+    };
+    const restore = (): void => {
+      process.chdir(previousCwd);
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    const configPath = path.join(dir, "explicit.json");
+    fs.writeFileSync(configPath, "{}");
+    process.env.OPENCODE_CONFIG = configPath;
+    process.env.OPENCODE_CONFIG_DIR = path.join(dir, "cfgdir");
+    process.env.XDG_CONFIG_HOME = path.join(dir, "xdg");
+    process.env.HOME = path.join(dir, "home");
+    delete process.env.OPENCODE_CONFIG_CONTENT;
+    process.chdir(dir);
+    return restore;
+  }
+
+  type CapturedCommand = {
+    name: string;
+    execute: (context?: {
+      sessionID?: string;
+      prompt?: { text?: string };
+      delivery?: string;
+    }) => Promise<void> | void;
+  };
+
+  /** Command transform fake capturing BOTH registered commands by name. */
+  function captureCommands(): {
+    commands: Map<string, CapturedCommand>;
+    transform: (
+      callback: (draft: { add(command: unknown): void }) => void,
+    ) => Promise<{ dispose(): Promise<void> | void }>;
+  } {
+    const commands = new Map<string, CapturedCommand>();
+    return {
+      commands,
+      transform: async (callback) => {
+        callback({
+          add: (command: unknown) => {
+            const captured = command as CapturedCommand;
+            commands.set(captured.name, captured);
+          },
+        });
+        return { dispose: async () => {} };
+      },
+    };
+  }
+
+  /**
+   * Run one native-merge case (explicit `xiaomi` argument) against a pinned
+   * models.dev registry; returns the touched catalog row, acks, and fetch log.
+   * The catalog row starts LIVE-SHAPED (empty materialized fields).
+   */
+  async function runNativeMergeCase(
+    registry: ReadonlyMap<string, { api?: string; models?: Record<string, unknown> }>,
+  ): Promise<{
+    row: Record<string, unknown>;
+    acks: Array<{ sessionID: string; text: string; description?: string }>;
+    fetched: string[];
+  }> {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergenative-case-"));
+    const restore = isolateConfigEnv(dir);
+    // Per-case state isolation: two cases inside one test must not seed each
+    // other's clocks through the shared per-test state file (a seeded clock
+    // skips the boot poll and breaks the boot-fetch-count assertions).
+    const previousStatePath = process.env[STATE_FILE_ENV];
+    const caseStatePath = path.join(dir, "opencode", "model-discovery", "state.json");
+    fs.mkdirSync(path.dirname(caseStatePath), { recursive: true });
+    process.env[STATE_FILE_ENV] = caseStatePath;
+    setModelsDevRegistryForTests(registry);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    const fetched: string[] = [];
+    globalThis.fetch = async (url: unknown) => {
+      fetched.push(String(url));
+      return new Response(JSON.stringify({ data: [{ id: "mimo" }] }), { status: 200 });
+    };
+    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const commandFake = captureCommands();
+    const rows = new Map<string, Record<string, unknown>>([
+      ["xiaomi:mimo", { name: "mimo", capabilities: {}, limit: {}, variants: [] }],
+    ]);
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: {
+        list: () => [{ provider: { id: "xiaomi", integrationID: "xi" } }],
+        get: () => undefined,
+        update: () => {},
+        remove: () => {},
+      },
+      model: {
+        get: () => undefined,
+        update: (providerID: string, modelID: string, update: (model: any) => void) => {
+          const key = `${providerID}:${modelID}`;
+          const row = rows.get(key) ?? {};
+          update(row);
+          rows.set(key, row);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: { providers: [{ id: "cfg", baseURL: "https://cfg.invalid/v1" }] },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          registered?.(draft);
+        },
+      },
+      command: { transform: commandFake.transform },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          acks.push(input);
+          return { id: "msg_merge_native_case" };
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const merge = commandFake.commands.get("models-discovery-merge");
+      await merge!.execute({ sessionID: "s1", prompt: { text: "xiaomi" } });
+      const row = rows.get("xiaomi:mimo") ?? {};
+      // Every case: the merge polls the native target once and never re-polls
+      // the config provider (which stays at its boot fetch count).
+      expect(fetched.filter((url) => url.includes("cfg.invalid")).length).toBe(1);
+      expect(fetched.filter((url) => url.includes("xiaomi.invalid/v1/models")).length).toBe(1);
+      await cleanup?.();
+      return { row, acks: [...acks], fetched: [...fetched] };
+    } finally {
+      setModelsDevRegistryForTests(new Map());
+      if (previousStatePath === undefined) delete process.env[STATE_FILE_ENV];
+      else process.env[STATE_FILE_ENV] = previousStatePath;
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("applyDiscovered gap-fills merge-flagged rows and never overwrites existing fields", () => {
+    const fullModel = {
+      name: "Full row",
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      limit: { context: 7, output: 3 },
+      variants: [{ id: "existing", settings: { reasoningEffort: "existing" } }],
+    };
+    const partialModel = { name: "Partial row", limit: { context: 9, output: 4 } };
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (_providerID: string, modelID: string, update: (model: any) => void) => {
+          update(modelID === "full" ? fullModel : partialModel);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const metadata = {
+      capabilities: { tools: false, input: ["image"], output: ["text"] },
+      limit: { context: 1000, input: 100, output: 50 },
+      variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
+    };
+
+    applyDiscovered(
+      draft,
+      new Map([
+        [
+          "p",
+          [
+            { id: "full", name: "Full discovered", enrich: true as const, merge: true, metadata },
+            { id: "partial", name: "Partial discovered", enrich: true as const, merge: true, metadata },
+          ],
+        ],
+      ]),
+    );
+
+    // An existing field is never overwritten, even by a merge cycle.
+    expect(fullModel).toEqual({
+      name: "Full row",
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      limit: { context: 7, output: 3 },
+      variants: [{ id: "existing", settings: { reasoningEffort: "existing" } }],
+    });
+    // Missing fields only: capabilities + variants filled, limit kept.
+    expect(partialModel).toEqual({
+      name: "Partial row",
+      capabilities: metadata.capabilities,
+      limit: { context: 9, output: 4 },
+      variants: metadata.variants,
+    });
+  });
+
+  test("applyDiscovered fills live-shaped rows materialized with empty fields (T5 defect 1 regression)", () => {
+    // Exactly how the live catalog materializes rows BEFORE transforms run:
+    // empty objects/arrays, never undefined.
+    const rowX: Record<string, unknown> = { name: "X", capabilities: {}, limit: {}, variants: [] };
+    const rowY: Record<string, unknown> = {
+      name: "Y",
+      capabilities: { tools: false, input: ["text"], output: ["text"] },
+      limit: {},
+      variants: [],
+    };
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (_providerID: string, modelID: string, update: (model: any) => void) => {
+          update(modelID === "x" ? rowX : rowY);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const metadata = {
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      limit: { context: 1000, output: 50 },
+      variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
+    };
+
+    applyDiscovered(
+      draft,
+      new Map([
+        [
+          "p",
+          [
+            { id: "x", name: "X", enrich: true as const, merge: true, metadata },
+            { id: "y", name: "Y", enrich: true as const, merge: true, metadata },
+          ],
+        ],
+      ]),
+    );
+
+    // Empty-materialized fields count as lacking: X gains ALL three.
+    expect(rowX).toEqual({ name: "X", ...metadata });
+    // Y keeps its non-empty capabilities byte-identical; limit + variants fill.
+    expect(rowY).toEqual({
+      name: "Y",
+      capabilities: { tools: false, input: ["text"], output: ["text"] },
+      limit: metadata.limit,
+      variants: metadata.variants,
+    });
+  });
+
+  test("applyDiscovered never overwrites non-empty fields on live-shaped rows", () => {
+    const metadata = {
+      capabilities: { tools: true, input: ["image"], output: ["text"] },
+      limit: { context: 1000, input: 100, output: 50 },
+      variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
+    };
+    const row = {
+      name: "Full",
+      capabilities: { tools: false, input: ["text"], output: ["text"] },
+      limit: { context: 7, output: 3 },
+      variants: [{ id: "existing", settings: { reasoningEffort: "existing" } }],
+    };
+    // Direct writer first: all three fields non-empty -> filled 0, untouched.
+    const snapshot = JSON.stringify(row);
+    expect(applyMetadataGapFill(row, { provenance: "provider-rich", metadata })).toBe(0);
+    expect(JSON.stringify(row)).toBe(snapshot);
+
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (_providerID: string, _modelID: string, update: (model: any) => void) => {
+          update(row);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+
+    applyDiscovered(
+      draft,
+      new Map([["p", [{ id: "full", name: "Full", enrich: true as const, merge: true, metadata }]]]),
+    );
+
+    // Merge cycle: values stay byte-identical (distinct from the metadata).
+    expect(JSON.stringify(row)).toBe(snapshot);
+    expect(row).toEqual({
+      name: "Full",
+      capabilities: { tools: false, input: ["text"], output: ["text"] },
+      limit: { context: 7, output: 3 },
+      variants: [{ id: "existing", settings: { reasoningEffort: "existing" } }],
+    });
+  });
+
+  test("applyDiscovered re-applies from the merged-ids map and honors the config-block guard", () => {
+    const rows: Record<string, Record<string, unknown>> = {
+      "seed-a": {},
+      blocked: {},
+      outsider: {},
+    };
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (_providerID: string, modelID: string, update: (model: any) => void) => {
+          update(rows[modelID]);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const metadata = {
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      limit: { context: 1000, output: 50 },
+      variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
+    };
+
+    applyDiscovered(
+      draft,
+      new Map([
+        [
+          "p",
+          [
+            { id: "seed-a", name: "Seed A", enrich: true as const, metadata },
+            { id: "blocked", name: "Blocked", enrich: true as const, metadata },
+            { id: "outsider", name: "Outsider" },
+          ],
+        ],
+      ]),
+      [],
+      {
+        mergedModelIds: new Map([["p", new Set(["seed-a", "blocked"])]]),
+        isConfigBlocked: (_providerID, modelID) => modelID === "blocked",
+      },
+    );
+
+    // No merge flag needed: the recorded id replays the gap-fill on restart.
+    expect(rows["seed-a"]).toEqual({ name: "Seed A", ...metadata });
+    // Config-blocked rows stay name-only; the guard never falls back to override.
+    expect(rows.blocked).toEqual({ name: "Blocked" });
+    // Ids outside the merged set follow the ordinary name-only path.
+    expect(rows.outsider).toEqual({ name: "Outsider" });
+  });
+
+  test("applyDiscovered registry join fills variants when the resolution lacks them", () => {
+    const row: Record<string, unknown> = {};
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (_providerID: string, _modelID: string, update: (model: any) => void) => {
+          update(row);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+
+    applyDiscovered(
+      draft,
+      new Map([["p", [{ id: "seed-b", name: "Seed B", enrich: true as const }]]]),
+      [],
+      {
+        mergedModelIds: new Map([["p", new Set(["seed-b"])]]),
+        registryJoin: () => [{ id: "low", settings: { reasoningEffort: "low" } }],
+      },
+    );
+
+    // Name-only resolution + registry join: ONLY variants are gap-filled.
+    expect(row).toEqual({
+      name: "Seed B",
+      variants: [{ id: "low", settings: { reasoningEffort: "low" } }],
+    });
+    expect("capabilities" in row).toBe(false);
+    expect("limit" in row).toBe(false);
+  });
+
+  test("registryJoinVariants joins efforts across models.dev providers", () => {
+    const registry = new Map([
+      ["xiaomi", { models: { mimo: { reasoning_options: [{ type: "toggle" }] } } }],
+      ["kilo", { models: { mimo: { reasoning_options: [{ type: "effort", values: ["low", "high"] }] } } }],
+      ["empty", {}],
+    ]);
+
+    expect(registryJoinVariants("xiaomi", "mimo", registry)).toEqual([
+      { id: "low", settings: { reasoningEffort: "low" } },
+      { id: "high", settings: { reasoningEffort: "high" } },
+    ]);
+    expect(registryJoinVariants("xiaomi", "other", registry)).toBeUndefined();
+    const selfOnly = new Map([
+      ["solo", { models: { m: { reasoning_options: [{ type: "effort", values: ["low"] }] } } }],
+    ]);
+    expect(registryJoinVariants("solo", "m", selfOnly)).toBeUndefined();
+  });
+
+  test("merge command arg parse: id, empty, unknown, headless", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergearg-"));
+    const restore = isolateConfigEnv(dir);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "mrg-m" }] }), { status: 200 });
+    };
+    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const commandFake = captureCommands();
+    const context = {
+      options: { providers: [{ id: "mrg", baseURL: "https://mrg.invalid/v1" }] },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+      command: { transform: commandFake.transform },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          acks.push(input);
+          return { id: "msg_merge_test" };
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // BOTH commands register; the merge command is addressable by name.
+      expect([...commandFake.commands.keys()].sort()).toEqual([
+        "models-discovery-merge",
+        "models-discovery-rescan",
+      ]);
+      const merge = commandFake.commands.get("models-discovery-merge");
+      expect(merge?.name).toBe("models-discovery-merge");
+      expect(acks.length).toBe(0);
+
+      const afterSetup = fetchCount;
+      await merge!.execute({ sessionID: "ses_merge_test", prompt: { text: "mrg" } });
+      expect(fetchCount).toBe(afterSetup + 1);
+      expect(acks[0].description).toBe("models-discovery-merge");
+      expect(acks[0].text).toContain('started for provider "mrg"');
+      expect(acks[1].text).toContain("merge complete");
+      expect(acks[1].text).toContain("Reopen the TUI model picker");
+
+      const afterProvider = fetchCount;
+      // This fake session has `synthetic` only (no `get`), so the empty-arg case exercises the no-`get` fallback.
+      await merge!.execute({ sessionID: "ses_merge_test", prompt: { text: "   " } });
+      expect(fetchCount).toBe(afterProvider + 1);
+      expect(acks[2].text).toContain("all 1 config provider(s): mrg");
+      expect(acks[3].text).toContain("merge complete");
+
+      const afterAll = fetchCount;
+      await merge!.execute({ sessionID: "ses_merge_test", prompt: { text: "ghost" } });
+      expect(fetchCount).toBe(afterAll);
+      expect(acks.length).toBe(5);
+      expect(acks[4].text).toContain('unknown provider "ghost"');
+      expect(acks[4].text).toContain("Config targets: mrg");
+      expect(acks[4].text).toContain("Native providers: (none)");
+
+      // Headless invocation (no sessionID) merges but posts no acks.
+      const beforeHeadless = fetchCount;
+      await merge!.execute({ prompt: { text: "mrg" } });
+      expect(fetchCount).toBe(beforeHeadless + 1);
+      expect(acks.length).toBe(5);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("empty argument merges the active model's provider (config target)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergeactive-"));
+    const restore = isolateConfigEnv(dir);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    const fetched: string[] = [];
+    globalThis.fetch = async (url: unknown) => {
+      fetched.push(String(url));
+      return new Response(JSON.stringify({ data: [{ id: "mrg-m1" }] }), { status: 200 });
+    };
+    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const commandFake = captureCommands();
+    const context = {
+      options: {
+        providers: [
+          { id: "mrg", baseURL: "https://mrg.invalid/v1" },
+          { id: "other", baseURL: "https://other.invalid/v1" },
+        ],
+      },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+      command: { transform: commandFake.transform },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          acks.push(input);
+          return { id: "msg_merge_active" };
+        },
+        get: async () => ({ model: { id: "m1", providerID: "mrg" } }),
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const merge = commandFake.commands.get("models-discovery-merge");
+      // The boot poll hits BOTH config providers; the merge must re-poll mrg only.
+      const mrgBefore = fetched.filter((url) => url.includes("mrg.invalid")).length;
+      const otherBefore = fetched.filter((url) => url.includes("other.invalid")).length;
+      expect(mrgBefore).toBe(1);
+      expect(otherBefore).toBe(1);
+
+      await merge!.execute({ sessionID: "s1", prompt: { text: "   " } });
+      expect(acks[0].description).toBe("models-discovery-merge");
+      expect(acks[0].text).toContain('the active model m1 on provider "mrg"');
+      expect(acks[1].text).toContain("merge complete");
+      // Only the active model's provider was re-polled; "other" was left alone.
+      expect(fetched.filter((url) => url.includes("mrg.invalid")).length).toBe(mrgBefore + 1);
+      expect(fetched.filter((url) => url.includes("other.invalid")).length).toBe(otherBefore);
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("empty argument merges the active model's native provider and polls only it", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergenative-"));
+    const restore = isolateConfigEnv(dir);
+    setModelsDevRegistryForTests(new Map([["xiaomi", { api: "https://xiaomi.invalid/v1" }]]));
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    const fetched: string[] = [];
+    globalThis.fetch = async (url: unknown) => {
+      fetched.push(String(url));
+      return new Response(JSON.stringify({ data: [{ id: "mimo-1" }, { id: "mimo-2" }] }), { status: 200 });
+    };
+    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const commandFake = captureCommands();
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: {
+        list: () => [{ provider: { id: "xiaomi", integrationID: "xi" } }],
+        get: () => undefined,
+        update: () => {},
+        remove: () => {},
+      },
+      model: {
+        get: () => undefined,
+        update: () => {},
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: { providers: [{ id: "cfg", baseURL: "https://cfg.invalid/v1" }] },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          registered?.(draft);
+        },
+      },
+      command: { transform: commandFake.transform },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          acks.push(input);
+          return { id: "msg_merge_native" };
+        },
+        get: async () => ({ model: { id: "mimo-v2.6-pro", providerID: "xiaomi" } }),
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const merge = commandFake.commands.get("models-discovery-merge");
+      // The boot poll touched the config provider only.
+      expect(fetched.filter((url) => url.includes("cfg.invalid")).length).toBe(1);
+      expect(fetched.filter((url) => url.includes("xiaomi.invalid")).length).toBe(0);
+
+      await merge!.execute({ sessionID: "s1", prompt: { text: "" } });
+      expect(acks[0].text).toContain('the active model mimo-v2.6-pro on native provider "xiaomi"');
+      expect(acks[1].text).toContain("merge complete");
+      // The merge polled ONLY the synthesized native target, never the config provider.
+      expect(fetched.filter((url) => url.includes("cfg.invalid")).length).toBe(1);
+      expect(fetched.filter((url) => url.includes("xiaomi.invalid"))).toEqual([
+        "https://xiaomi.invalid/v1/models",
+      ]);
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.providers.xiaomi.mergedModelIds).toEqual(["mimo-1", "mimo-2"]);
+      await cleanup?.();
+    } finally {
+      setModelsDevRegistryForTests(new Map());
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("explicit native merge polls only the native target (T5 defect 2 regression)", async () => {
+    const result = await runNativeMergeCase(
+      new Map([["xiaomi", { api: "https://xiaomi.invalid/v1" }]]),
+    );
+    // The explicit argument reached the native branch: exactly the synthesized
+    // target URL, and the config provider stays at its boot fetch count (the
+    // helper already asserted cfg == 1 and xiaomi == 1).
+    expect(result.fetched.filter((url) => url.includes("xiaomi.invalid"))).toEqual([
+      "https://xiaomi.invalid/v1/models",
+    ]);
+    expect(result.acks[0].text).toContain('native provider "xiaomi"');
+    expect(result.acks[1].text).toContain("merge complete");
+  });
+
+  test("toggle-only own registry entry suppresses the join and acks the honest line", async () => {
+    const result = await runNativeMergeCase(
+      new Map([
+        [
+          "xiaomi",
+          {
+            api: "https://xiaomi.invalid/v1",
+            models: { mimo: { reasoning_options: [{ type: "toggle" }] } },
+          },
+        ],
+        ["kilo", { models: { mimo: { reasoning_options: [{ type: "effort", values: ["low"] }] } } }],
+      ]),
+    );
+
+    // Suppressed: no gateway-side effort variants flow in, and the bare /models
+    // entry supplied nothing else — the live-shaped row is untouched.
+    expect(result.row).toEqual({ name: "mimo", capabilities: {}, limit: {}, variants: [] });
+    const suppression = result.acks.filter((ack) => ack.text.includes("thinking toggle only"));
+    expect(suppression.length).toBe(1);
+    expect(suppression[0].text).toStartWith(
+      'Provider "xiaomi" exposes no effort levels (thinking toggle only); efforts on other providers are gateway-side mappings.',
+    );
+  });
+
+  test("registry join still applies when the own entry is missing or lacks the toggle", async () => {
+    const kiloEffort = {
+      models: { mimo: { reasoning_options: [{ type: "effort", values: ["low"] }] } },
+    };
+    // (a) Provider entry present (for the api base) but NO own model entry: the
+    // join has no own toggle statement to honor and fills from kilo.
+    const missingOwn = await runNativeMergeCase(
+      new Map([
+        ["xiaomi", { api: "https://xiaomi.invalid/v1" }],
+        ["kilo", kiloEffort],
+      ]),
+    );
+    expect(missingOwn.row.variants).toEqual([{ id: "low", settings: { reasoningEffort: "low" } }]);
+    expect(missingOwn.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(false);
+
+    // (b) Own entry declares efforts (no toggle): nothing to suppress.
+    const ownEffort = await runNativeMergeCase(
+      new Map([
+        [
+          "xiaomi",
+          {
+            api: "https://xiaomi.invalid/v1",
+            models: { mimo: { reasoning_options: [{ type: "effort", values: ["own"] }] } },
+          },
+        ],
+        ["kilo", kiloEffort],
+      ]),
+    );
+    expect(ownEffort.row.variants).toEqual([{ id: "low", settings: { reasoningEffort: "low" } }]);
+    expect(ownEffort.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(false);
+  });
+
+  test("isToggleOnlyReasoning classifies toggle-only, effort, missing, and mixed shapes", async () => {
+    // runtime.ts keeps isToggleOnlyReasoning module-private (no export), so the
+    // classification matrix is asserted through its only observable surface:
+    // the merge registry join (suppress vs fill) and the toggle-only ack.
+    // "missing own entry -> false" and "effort -> false" live in the join suite
+    // above; "plain toggle -> true" lives in the toggle-only suite above.
+    const kiloEffort = {
+      models: { mimo: { reasoning_options: [{ type: "effort", values: ["low"] }] } },
+    };
+
+    // Empty list -> false: joins exactly like a missing own entry.
+    const emptyList = await runNativeMergeCase(
+      new Map([
+        [
+          "xiaomi",
+          {
+            api: "https://xiaomi.invalid/v1",
+            models: { mimo: { reasoning_options: [] } },
+          },
+        ],
+        ["kilo", kiloEffort],
+      ]),
+    );
+    expect(emptyList.row.variants).toEqual([{ id: "low", settings: { reasoningEffort: "low" } }]);
+    expect(emptyList.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(false);
+
+    // toggle + effort -> false: the effort entry wins, the join applies.
+    const mixedEffort = await runNativeMergeCase(
+      new Map([
+        [
+          "xiaomi",
+          {
+            api: "https://xiaomi.invalid/v1",
+            models: {
+              mimo: { reasoning_options: [{ type: "toggle" }, { type: "effort", values: ["low"] }] },
+            },
+          },
+        ],
+        ["kilo", kiloEffort],
+      ]),
+    );
+    expect(mixedEffort.row.variants).toEqual([{ id: "low", settings: { reasoningEffort: "low" } }]);
+    expect(mixedEffort.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(false);
+
+    // toggle + other -> true: still toggle-only, the join is suppressed.
+    const mixedOther = await runNativeMergeCase(
+      new Map([
+        [
+          "xiaomi",
+          {
+            api: "https://xiaomi.invalid/v1",
+            models: { mimo: { reasoning_options: [{ type: "toggle" }, { type: "other" }] } },
+          },
+        ],
+        ["kilo", kiloEffort],
+      ]),
+    );
+    expect(mixedOther.row.variants).toEqual([]);
+    expect(mixedOther.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(true);
+  });
+
+  test("empty argument falls back to merge-all when the active model is unset, unknown, headless, or registry-less", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergefallback-"));
+    const restore = isolateConfigEnv(dir);
+    // Empty registry: the native "xiaomi" provider has no usable api base.
+    setModelsDevRegistryForTests(new Map());
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "fb-m1" }] }), { status: 200 });
+    };
+    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const commandFake = captureCommands();
+    let sessionGetResult: unknown = {};
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: {
+        list: () => [{ provider: { id: "xiaomi", integrationID: "xi" } }],
+        get: () => undefined,
+        update: () => {},
+        remove: () => {},
+      },
+      model: {
+        get: () => undefined,
+        update: () => {},
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: {
+        providers: [
+          { id: "mrg", baseURL: "https://mrg.invalid/v1" },
+          { id: "other", baseURL: "https://other.invalid/v1" },
+        ],
+      },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          registered?.(draft);
+        },
+      },
+      command: { transform: commandFake.transform },
+      session: {
+        synthetic: async (input: { sessionID: string; text: string; description?: string }) => {
+          acks.push(input);
+          return { id: "msg_merge_fallback" };
+        },
+        get: async () => sessionGetResult,
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const merge = commandFake.commands.get("models-discovery-merge");
+
+      // (a) Session record without a model: the active model is unset.
+      sessionGetResult = {};
+      await merge!.execute({ sessionID: "s1", prompt: { text: "" } });
+      expect(acks[0].text).toContain("all 2 config provider(s)");
+      expect(acks[1].text).toContain("merge complete");
+
+      // (b) Active model names a provider that is neither a target nor native.
+      sessionGetResult = { model: { id: "x", providerID: "ghost" } };
+      await merge!.execute({ sessionID: "s1", prompt: { text: "  " } });
+      expect(acks.at(-2)!.text).toContain("all 2 config provider(s)");
+      expect(acks.at(-1)!.text).toContain("merge complete");
+
+      // (c) Headless (no sessionID): the merge still runs, acks stay silent.
+      const headlessFetches = fetchCount;
+      const acksBeforeHeadless = acks.length;
+      await merge!.execute({ prompt: { text: "" } });
+      expect(fetchCount).toBe(headlessFetches + 2);
+      expect(acks.length).toBe(acksBeforeHeadless);
+
+      // (d) Native provider in the catalog, but the registry knows no api base:
+      // falls through to the merge-all path.
+      sessionGetResult = { model: { id: "mimo-v2.6-pro", providerID: "xiaomi" } };
+      await merge!.execute({ sessionID: "s1", prompt: { text: "" } });
+      expect(acks.at(-2)!.text).toContain("all 2 config provider(s)");
+      expect(acks.at(-1)!.text).toContain("merge complete");
+      await cleanup?.();
+    } finally {
+      setModelsDevRegistryForTests(new Map());
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("merge cycle persists mergedModelIds and stamps command trigger", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergestate-"));
+    const restore = isolateConfigEnv(dir);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "mm-1" }, { id: "mm-2" }] }), { status: 200 });
+    };
+    const commandFake = captureCommands();
+    const context = {
+      options: { providers: [{ id: "mstate", baseURL: "https://mstate.invalid/v1" }] },
+      catalog: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+      },
+      command: { transform: commandFake.transform },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const merge = commandFake.commands.get("models-discovery-merge");
+      const beforeMerge = fetchCount;
+      await merge!.execute({});
+      expect(fetchCount).toBe(beforeMerge + 1);
+      const onDisk = JSON.parse(fs.readFileSync(isolatedStatePath, "utf8"));
+      expect(onDisk.version).toBe(2);
+      expect(onDisk.providers.mstate.mergedModelIds).toEqual(["mm-1", "mm-2"]);
+      expect(onDisk.providers.mstate.lastTrigger).toBe("command");
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("merge fills only missing catalog fields via the registry join", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergefill-"));
+    const restore = isolateConfigEnv(dir);
+    setModelsDevRegistryForTests(
+      new Map([
+        ["other", { models: { "mm-1": { reasoning_options: [{ type: "effort", values: ["low"] }] } } }],
+      ]),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [{ id: "mm-1" }] }), { status: 200 });
+    };
+    const rows = new Map<string, Record<string, unknown>>([
+      ["mfill:mm-1", { name: "Existing", limit: { context: 5, output: 5 } }],
+    ]);
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (providerID: string, modelID: string, update: (model: any) => void) => {
+          const key = `${providerID}:${modelID}`;
+          const row = rows.get(key) ?? {};
+          update(row);
+          rows.set(key, row);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const commandFake = captureCommands();
+    const context = {
+      options: { providers: [{ id: "mfill", baseURL: "https://mfill.invalid/v1" }] },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          registered?.(draft);
+        },
+      },
+      command: { transform: commandFake.transform },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      const merge = commandFake.commands.get("models-discovery-merge");
+      await merge!.execute({ sessionID: "ses_merge_fill" });
+      const row = rows.get("mfill:mm-1");
+      // The bare /models entry carries no variants; the registry join supplies
+      // them while the pre-existing limit and name stay untouched.
+      expect(row?.variants).toEqual([{ id: "low", settings: { reasoningEffort: "low" } }]);
+      expect(row?.limit).toEqual({ context: 5, output: 5 });
+      expect(row?.name).toBe("Existing");
+      expect(fetchCount).toBe(2);
+      await cleanup?.();
+    } finally {
+      setModelsDevRegistryForTests(new Map());
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("restart seeds merged ids from state and re-applies gap-fill without polling", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergehydrate-"));
+    const restore = isolateConfigEnv(dir);
+    const now = Date.now();
+    const seededMetadata = {
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
+    };
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "p1",
+            withMergedModelIds(
+              {
+                // Fresh success clock: the boot cycle must skip the network ...
+                lastSuccessMs: now - 10_000,
+                lastPolledMs: now - 10_000,
+                modelCount: 1,
+                cacheForSeconds: 86400,
+                lastTrigger: "poll",
+                // ... and re-apply the recorded gap-fill from disk.
+                models: [{ id: "seed-b", enrich: true as const, metadata: seededMetadata }],
+              },
+              ["seed-b"],
+            ),
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    };
+    const rows = new Map<string, Record<string, unknown>>([
+      ["p1:seed-b", { name: "X", limit: { context: 5, output: 5 } }],
+    ]);
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (providerID: string, modelID: string, update: (model: any) => void) => {
+          const key = `${providerID}:${modelID}`;
+          const row = rows.get(key) ?? {};
+          update(row);
+          rows.set(key, row);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }], cacheFor: 86400 },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          registered?.(draft);
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // TTL honored: the boot cycle touches no network ...
+      expect(fetchCount).toBe(0);
+      // ... yet the recorded merged id replays the gap-fill against the row.
+      expect(rows.get("p1:seed-b")).toEqual({
+        name: "X",
+        limit: { context: 5, output: 5 },
+        capabilities: seededMetadata.capabilities,
+        variants: seededMetadata.variants,
+      });
+      await cleanup?.();
+    } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("withMergedModelIds round-trips; legacy v2 reads as empty", () => {
+    const roundTrip = buildStateFile(
+      new Map([
+        ["p", withMergedModelIds({ modelCount: 1, cacheForSeconds: null, lastTrigger: "poll" }, ["a", "b"])],
+      ]),
+    );
+    writeStateFile(isolatedStatePath, roundTrip);
+    const loaded = loadStateFile(isolatedStatePath);
+    expect(loaded).not.toBeNull();
+    expect(mergedModelIdsFor(loaded!, "p")).toEqual(["a", "b"]);
+
+    // Hand-written legacy v2 entry without the field reads as none.
+    const legacy = {
+      version: 2,
+      providers: {
+        p: {
+          lastSuccessAt: new Date().toISOString(),
+          lastPolledAt: new Date().toISOString(),
+          modelCount: 1,
+          cacheForSeconds: null,
+          lastTrigger: "poll",
+        },
+      },
+    };
+    fs.writeFileSync(isolatedStatePath, JSON.stringify(legacy));
+    const legacyLoaded = loadStateFile(isolatedStatePath);
+    expect(mergedModelIdsFor(legacyLoaded!, "p")).toEqual([]);
+
+    // A malformed value is tolerated like an absent one.
+    const malformed = {
+      ...legacy,
+      providers: { p: { ...legacy.providers.p, mergedModelIds: "nope" } },
+    };
+    fs.writeFileSync(isolatedStatePath, JSON.stringify(malformed));
+    const malformedLoaded = loadStateFile(isolatedStatePath);
+    expect(mergedModelIdsFor(malformedLoaded!, "p")).toEqual([]);
+  });
+
+  test("formatMergeAck renders counts, failures, and the TUI reopen note", () => {
+    const errorAck = formatMergeAck({ outcome: "error", polled: 0, discoveredCounts: [], failed: [] });
+    expect(errorAck).toContain("failed");
+
+    const completeAck = formatMergeAck({
+      outcome: "complete",
+      polled: 1,
+      discoveredCounts: [["p", 2]],
+      failed: [],
+    });
+    expect(completeAck).toContain("2 model(s)");
+    expect(completeAck).toContain("Reopen the TUI model picker");
+
+    const failedAck = formatMergeAck({
+      outcome: "complete",
+      polled: 2,
+      discoveredCounts: [["p", 1]],
+      failed: ["p"],
+    });
+    expect(failedAck).toContain("Failed, kept last known: p");
+    expect(failedAck).toContain("Reopen the TUI model picker");
   });
 });
 

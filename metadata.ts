@@ -202,6 +202,27 @@ export function mergeVariants(
   return variants.length > 0 ? variants : undefined;
 }
 
+/**
+ * Cross-provider effort join for merge cycles: effort variants for a model
+ * id as OTHER providers define it in the models.dev registry
+ * (reasoning_options type "effort"). Pure — the caller supplies the registry
+ * snapshot; the first non-empty effort list wins.
+ */
+export function registryJoinVariants(
+  selfProviderID: string,
+  modelID: string,
+  registry: ReadonlyMap<string, { models?: Readonly<Record<string, unknown>> }>,
+): ModelVariantLite[] | undefined {
+  for (const [providerID, entry] of registry) {
+    if (providerID === selfProviderID) continue;
+    const model = entry.models?.[modelID];
+    if (!isRecord(model)) continue;
+    const variants = parseReasoningOptionVariants(model.reasoning_options);
+    if (variants !== undefined) return variants;
+  }
+  return undefined;
+}
+
 function composeMetadata(
   capabilities: ModelCapabilitiesLite | undefined,
   limit: ModelLimitLite | undefined,
@@ -447,6 +468,47 @@ export function resolveModelMetadata(
   const provenance: EnrichmentProvenance =
     richUsed && joinUsed ? "mixed" : richUsed ? "provider-rich" : "join";
   return { metadata, provenance };
+}
+
+/**
+ * Gap-fill writer for catalog rows: assigns a resolved metadata field ONLY
+ * when the row lacks it; an existing field is never overwritten. Name stays
+ * with discoveredModelName. Pure — no I/O, no logging.
+ * A field counts as lacking when absent OR empty (the live catalog materializes empty objects/arrays before transforms run).
+ */
+export function applyMetadataGapFill(
+  row: {
+    capabilities?: ModelCapabilitiesLite;
+    limit?: ModelLimitLite;
+    variants?: ModelVariantLite[];
+  },
+  resolution: ModelEnrichmentResolution | undefined,
+): number {
+  const metadata = resolution?.metadata;
+  if (!metadata) return 0;
+  let filled = 0;
+  if (
+    (row.capabilities === undefined || Object.keys(row.capabilities).length === 0) &&
+    metadata.capabilities !== undefined
+  ) {
+    row.capabilities = metadata.capabilities;
+    filled += 1;
+  }
+  if (
+    (row.limit === undefined || Object.keys(row.limit).length === 0) &&
+    metadata.limit !== undefined
+  ) {
+    row.limit = metadata.limit;
+    filled += 1;
+  }
+  if (
+    (row.variants === undefined || row.variants.length === 0) &&
+    metadata.variants !== undefined
+  ) {
+    row.variants = metadata.variants;
+    filled += 1;
+  }
+  return filled;
 }
 
 export function entryMatches(entry: ModelEntry, filter: string | undefined): boolean {

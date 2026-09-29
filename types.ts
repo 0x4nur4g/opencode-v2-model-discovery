@@ -10,6 +10,11 @@ interface ModelInfoLite {
   name: string;
 }
 
+/** Merge-cycle discovery entry flag: the transform gap-fills instead of overriding. */
+interface MergeEntryFlagLite {
+  readonly merge?: true;
+}
+
 interface CatalogDraftLite {
   model: {
     get(providerID: string, modelID: string): ModelInfoLite | undefined;
@@ -80,10 +85,16 @@ interface PluginContextLite {
   /**
    * Session surface for user-visible command acknowledgements; absent in
    * mocks and runtimes without it. `synthetic` posts a synthetic session
-   * message without triggering an agent run.
+   * message without triggering an agent run. `get` reads a session record.
    */
   session?: {
     synthetic(input: { sessionID: string; text: string; description?: string }): Promise<unknown>;
+    /**
+     * Read a session record (sanctioned v2 surface). The session's active
+     * model lives at info.model ({id, providerID, variant?}); absent when no
+     * model is selected. Optional: older runtimes expose only synthetic.
+     */
+    get?(input: { sessionID: string }): Promise<unknown>;
   };
   /** Event subscription surface; no unsubscribe handle is exposed. */
   event?: {

@@ -639,10 +639,15 @@ async function main(): Promise<void> {
   ]) {
     assert(!warningText.includes(unsafe), `safe warnings must omit ${unsafe}`);
   }
+  // Two allowed sanitized shapes: (a) safe-warn helpers exposing marker/config
+  // + status fields; (b) the catalog-surface degradation warning, sanitized by
+  // construction (error NAME only — never message/stack), fixed suffix.
   assert(
     warnings.length > 0 &&
       warnings.every((warning) =>
-        /(?:marker=|config=).+status=(?:unknown|\d+)/.test(warning),
+        /(?:marker=|config=).+status=(?:unknown|\d+)|^\[opencode-v2-model-discovery\] catalog surface "[^"]+" unusable \(error=[A-Za-z][A-Za-z0-9]*\); polling only\.$/.test(
+          warning,
+        ),
       ),
     `safe warnings must expose only marker/config and status fields: ${warningText}`,
   );

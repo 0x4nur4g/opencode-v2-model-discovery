@@ -34,6 +34,7 @@ import {
   type ProviderTarget,
 } from "./config.ts";
 import {
+  applyMetadataGapFill,
   buildCatalogJoin,
   discoveredModelName,
   effortVariants,
@@ -44,6 +45,7 @@ import {
   parseParametersCapabilities,
   parseParametersLimit,
   reconcileOwnedModelIds,
+  registryJoinVariants,
   resolveModelMetadata,
   retainLastGood,
   type CatalogJoinCandidate,
@@ -57,7 +59,9 @@ import {
 import {
   buildStateFile,
   loadStateFile,
+  mergedModelIdsFor,
   resolveStateFilePath,
+  withMergedModelIds,
   writeStateFile,
   type ProviderStateInput,
   type StateTrigger,
@@ -272,16 +276,16 @@ function discoverAuto(
   disabledIds: ReadonlySet<string>,
   warnedProblems: Set<string>,
   globalParametersPath?: string,
-): ProviderTarget[] {
+): { targets: ProviderTarget[]; providers: ProviderConfigMap | undefined } {
   const providers = readAutoProviders(configSources, warnedProblems);
-  if (!providers) return [];
+  if (!providers) return { targets: [], providers: undefined };
 
   const selection = selectAutoTargets(providers, disabledIds, process.env, globalParametersPath);
   for (const message of selection.messages) {
     const write = message.level === "warn" ? console.warn : console.log;
     write(`${LOG_PREFIX} ${message.message}`);
   }
-  return selection.targets;
+  return { targets: selection.targets, providers };
 }
 
 /** Per-poll parameters context: cache TTL knobs and the rescan bypass flag. */
@@ -545,6 +549,206 @@ export type StoreAuthResolver = (
   integrationID?: string,
 ) => Promise<string | undefined>;
 
+/** models.dev public registry entry slices the merge path needs. */
+interface ModelsDevProviderLite {
+  readonly api?: string;
+  readonly env?: readonly string[];
+  readonly models?: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Process-global cache slot: a plugin module re-eval ("opencode reload") must
+ * not reset the registry cache — a module-scope counter was observed resetting
+ * on reload (v2.0.17, 2026-09-26).
+ */
+interface ModelsDevCacheHost {
+  __opencodeModelsDiscoveryRegistry?: Promise<ReadonlyMap<string, ModelsDevProviderLite>>;
+}
+const modelsDevCacheHost = globalThis as ModelsDevCacheHost;
+
+/**
+ * Fetch the public models.dev provider registry (api.json) at most once per
+ * process and cache it in memory — never refetched per cycle. Field `api` is
+ * the OpenAI-compatible base URL (197/223 providers carry it; verified live
+ * 2026-09-26); `models` powers the cross-provider effort join. Any failure
+ * resolves to an empty map; never logs, never throws.
+ */
+function loadModelsDevProviders(): Promise<ReadonlyMap<string, ModelsDevProviderLite>> {
+  if (modelsDevCacheHost.__opencodeModelsDiscoveryRegistry === undefined) {
+    modelsDevCacheHost.__opencodeModelsDiscoveryRegistry = fetch("https://models.dev/api.json")
+      .then(async (response): Promise<ReadonlyMap<string, ModelsDevProviderLite>> => {
+        if (!response.ok) return new Map();
+        const body: unknown = await response.json();
+        if (!isRecord(body)) return new Map();
+        const providers = new Map<string, ModelsDevProviderLite>();
+        for (const [id, entry] of Object.entries(body)) {
+          if (!isRecord(entry)) continue;
+          const api = typeof entry.api === "string" ? entry.api : undefined;
+          const env =
+            Array.isArray(entry.env) && entry.env.every((name) => typeof name === "string")
+              ? (entry.env as readonly string[])
+              : undefined;
+          const models = isRecord(entry.models)
+            ? (entry.models as Readonly<Record<string, unknown>>)
+            : undefined;
+          providers.set(id, {
+            ...(api !== undefined ? { api } : {}),
+            ...(env !== undefined ? { env } : {}),
+            ...(models !== undefined ? { models } : {}),
+          });
+        }
+        return providers;
+      })
+      .catch(() => new Map());
+  }
+  return modelsDevCacheHost.__opencodeModelsDiscoveryRegistry;
+}
+
+/** Test-only: pre-populate the process-global registry cache (no network). */
+export function setModelsDevRegistryForTests(
+  registry: ReadonlyMap<string, ModelsDevProviderLite> | undefined,
+): void {
+  if (registry === undefined) {
+    delete modelsDevCacheHost.__opencodeModelsDiscoveryRegistry;
+  } else {
+    modelsDevCacheHost.__opencodeModelsDiscoveryRegistry = Promise.resolve(registry);
+  }
+}
+
+/**
+ * Synthesize a merge target for a NATIVE provider (models.dev rows, no config
+ * entry): baseURL from the registry `api` field, apiKeyEnv from its env hint,
+ * integrationID from the live catalog provider record. Undefined when the
+ * registry has no usable api base for the id.
+ */
+function buildNativeMergeTarget(
+  providerID: string,
+  integrationID: string | undefined,
+  registry: ReadonlyMap<string, ModelsDevProviderLite>,
+): ProviderTarget | undefined {
+  const entry = registry.get(providerID);
+  const api = entry?.api;
+  if (api === undefined || api.trim() === "") return undefined;
+  const apiKeyEnv =
+    entry?.env !== undefined && entry.env.length > 0 && entry.env[0] !== undefined && entry.env[0].trim() !== ""
+      ? entry.env[0]
+      : undefined;
+  return {
+    id: providerID,
+    baseURL: api.trim().replace(/\/+$/, ""),
+    ...(apiKeyEnv !== undefined ? { apiKeyEnv } : {}),
+    ...(integrationID !== undefined ? { integrationID } : {}),
+  };
+}
+
+/** Dependencies for the no-argument merge path: inferred provider or all targets. */
+interface MergeNoArgDeps {
+  readonly sessionApi: PluginContextLite["session"] | undefined;
+  readonly sessionID: string | undefined;
+  readonly targetIds: ReadonlySet<string>;
+  readonly catalogProviderInfo: ReadonlyMap<string, string | undefined>;
+  readonly configTargetCount: number;
+  readonly runMerge: (
+    label: string,
+    providerFilter: ReadonlySet<string> | undefined,
+    extraTargets?: readonly ProviderTarget[],
+  ) => Promise<void>;
+  /** Assign the models.dev snapshot before the merge cycle (the join reads it). */
+  readonly setRegistry: (registry: ReadonlyMap<string, ModelsDevProviderLite>) => void;
+}
+
+/**
+ * No-argument merge: infer the provider from the session's ACTIVE model
+ * (sanctioned read: ctx.session.get -> SessionInfo.model, v2.0.17); fall back
+ * to merging all config targets. Module-level so the command closure stays
+ * under the complexity gate.
+ */
+async function runMergeNoArg(deps: MergeNoArgDeps): Promise<void> {
+  const activeModel = await resolveActiveSessionModel(deps.sessionApi, deps.sessionID);
+  const providerID = activeModel?.providerID;
+  if (
+    providerID !== undefined &&
+    activeModel !== undefined &&
+    (deps.targetIds.has(providerID) || deps.catalogProviderInfo.has(providerID))
+  ) {
+    const registry = await loadModelsDevProviders();
+    deps.setRegistry(registry);
+    if (deps.targetIds.has(providerID)) {
+      await deps.runMerge(
+        `the active model ${activeModel.id} on provider "${providerID}"`,
+        new Set([providerID]),
+      );
+      return;
+    }
+    const nativeTarget = buildNativeMergeTarget(
+      providerID,
+      deps.catalogProviderInfo.get(providerID),
+      registry,
+    );
+    if (nativeTarget !== undefined) {
+      await deps.runMerge(
+        `the active model ${activeModel.id} on native provider "${providerID}"`,
+        new Set([providerID]),
+        [nativeTarget],
+      );
+      return;
+    }
+  }
+  deps.setRegistry(await loadModelsDevProviders());
+  await deps.runMerge(
+    `all ${deps.configTargetCount} config provider(s): ${[...deps.targetIds].join(", ")}`,
+    undefined,
+  );
+}
+
+/**
+ * Resolve the session's active model via the sanctioned ctx.session.get read
+ * (SessionInfo.model = {id, providerID, variant?}, v2.0.17). Undefined when
+ * headless, unreadable, unset, or malformed — callers fall back.
+ */
+async function resolveActiveSessionModel(
+  sessionApi: PluginContextLite["session"] | undefined,
+  sessionID: string | undefined,
+): Promise<{ id: string; providerID: string } | undefined> {
+  if (sessionID === undefined) return undefined;
+  try {
+    const info = await sessionApi?.get?.({ sessionID });
+    const model = (info as { model?: { id?: unknown; providerID?: unknown } } | undefined)?.model;
+    if (
+      typeof model?.id !== "string" ||
+      model.id === "" ||
+      typeof model.providerID !== "string" ||
+      model.providerID === ""
+    ) {
+      return undefined;
+    }
+    return { id: model.id, providerID: model.providerID };
+  } catch {
+    // Best-effort inference: an unreadable session falls back to merge-all.
+  }
+  return undefined;
+}
+
+/** Best-effort synthetic session ack: never throws, never rejects. */
+function postSyntheticAck(
+  sessionApi: PluginContextLite["session"] | undefined,
+  sessionID: string | undefined,
+  description: string,
+  text: string,
+): void {
+  if (sessionID === undefined) return;
+  try {
+    const posted = sessionApi?.synthetic?.({
+      sessionID,
+      text: `${text} [${new Date().toISOString()}]`,
+      description,
+    });
+    if (posted && typeof posted.catch === "function") posted.catch(() => {});
+  } catch {
+    // Ack is cosmetic; a failing ack surface must not break the scan.
+  }
+}
+
 /** Per-cycle store resolver: each provider id resolves at most once per cycle. */
 export function createStoreAuthResolver(ctx: PluginContextLite | undefined): StoreAuthResolver {
   const cache = new Map<string, string | undefined>();
@@ -630,6 +834,24 @@ export function formatRescanAck(summary: RefreshSummary): string {
   if (summary.failed.length > 0) {
     parts.push(`Failed, kept last known: ${summary.failed.join(", ")}.`);
   }
+  return parts.join(" ");
+}
+
+/** Format a merge ack message; sanitized (ids and counts only, never errors). */
+export function formatMergeAck(summary: RefreshSummary): string {
+  if (summary.outcome === "error") {
+    return "Models-discovery merge failed; previous models kept. Check server logs.";
+  }
+  const total = summary.discoveredCounts.reduce((sum, [, count]) => sum + count, 0);
+  const parts = [
+    `Models-discovery merge complete: ${total} model(s) across ${summary.discoveredCounts.length} provider(s) checked for missing metadata.`,
+  ];
+  if (summary.failed.length > 0) {
+    parts.push(`Failed, kept last known: ${summary.failed.join(", ")}.`);
+  }
+  // The TUI caches the resolved model at selection time (verified v2.0.17):
+  // the picker must be reopened to see newly gap-filled efforts.
+  parts.push("Reopen the TUI model picker to see the new efforts.");
   return parts.join(" ");
 }
 
@@ -746,28 +968,101 @@ async function pollAll(
   return new Map(results);
 }
 
+/** Merge-cycle discovery entry: the transform gap-fills it instead of overriding. */
+type MergeModelEntry = ModelEntry & MergeEntryFlagLite;
+
+/** Optional merge context for applyDiscovered. */
+interface MergeContext {
+  /** Per-provider catalog row ids this plugin gap-filled; replays re-apply. */
+  readonly mergedModelIds?: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Q5/Q6 guard: return true to skip gap-fill for this row. */
+  readonly isConfigBlocked?: (providerID: string, modelID: string) => boolean;
+  /** Cross-provider effort join from the models.dev registry snapshot. */
+  readonly registryJoin?: (providerID: string, modelID: string) => ModelVariantLite[] | undefined;
+}
+
+/**
+ * Q5 verdict (live, v2.0.17): the host ConfigProviderPlugin registers last
+ * (internal post) and its reset branch replaces variants on any hand `models`
+ * entry that omits the variants key — catalog-side merge on those rows is
+ * futile. Skip them. Rows WITHOUT a hand config entry (all native providers)
+ * keep plugin gap-fill across rebuilds; config-declared rows keep config
+ * values (config wins by host design; config-side persistence is a follow-up).
+ */
+function isMergeConfigBlocked(
+  configBlockedModelIds: ReadonlyMap<string, ReadonlySet<string>>,
+  providerID: string,
+  modelID: string,
+): boolean {
+  const blocked = configBlockedModelIds.get(providerID);
+  return blocked !== undefined && blocked.has(modelID);
+}
+
+/**
+ * True when reasoning_options carry a toggle but no effort levels — the
+ * registry's explicit statement that the provider exposes no efforts.
+ */
+function isToggleOnlyReasoning(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length === 0) return false;
+  let hasToggle = false;
+  for (const option of value) {
+    if (!isRecord(option)) continue;
+    if (option.type === "effort") return false;
+    if (option.type === "toggle") hasToggle = true;
+  }
+  return hasToggle;
+}
+
 /**
  * Catalog transform body: read the closure map and enrich matching models.
  * Per-model try/catch: a model missing from the draft or a rejecting update
  * must not abort the remaining updates. Enrichment fields are assigned only
  * for explicitly enriched entries; ordinary entries remain name-only.
+ * Merge-flagged rows (and ids in the merged set) gap-fill via applyMetadataGapFill instead.
  */
 export function applyDiscovered(
   draft: CatalogDraftLite,
   discovered: ReadonlyMap<string, ModelEntry[]>,
   joinCandidates: readonly CatalogJoinCandidate[] = [],
+  merge?: MergeContext,
 ): void {
   let skipped = 0;
   for (const [providerID, models] of discovered) {
+    const merged = merge?.mergedModelIds?.get(providerID);
     for (const modelEntry of models) {
       try {
         const resolution =
           modelEntry.enrich === true
             ? resolveModelMetadata(providerID, modelEntry.id, modelEntry.metadata, joinCandidates)
             : { provenance: "name-only" as const };
+        // Merge semantics: entries from a merge cycle, or ids recorded in the
+        // merged set (replay/restart re-apply), gap-fill instead of override.
+        const mergeMode =
+          (modelEntry as MergeModelEntry).merge === true || merged?.has(modelEntry.id) === true;
+        const blocked = mergeMode && merge?.isConfigBlocked?.(providerID, modelEntry.id) === true;
         draft.model.update(providerID, modelEntry.id, (model) => {
           const richModel = model as ModelInfoRichLite;
           richModel.name = discoveredModelName(richModel.name, modelEntry.id, modelEntry.name);
+          if (mergeMode) {
+            // Blocked rows stay name-only; the guard never falls back to override.
+            if (!blocked) {
+              let fill = resolution;
+              // Bare /models with an ambiguous (or empty) catalog join: the
+              // models.dev registry join supplies effort variants other
+              // providers define for the same model id.
+              if (resolution.metadata?.variants === undefined) {
+                const joined = merge?.registryJoin?.(providerID, modelEntry.id);
+                if (joined !== undefined) {
+                  fill = {
+                    provenance: "join",
+                    metadata: { ...resolution.metadata, variants: joined },
+                  };
+                }
+              }
+              applyMetadataGapFill(richModel, fill);
+            }
+            return;
+          }
           if (resolution.metadata?.capabilities) {
             richModel.capabilities = resolution.metadata.capabilities;
           }
@@ -807,7 +1102,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   const disabledIds = manual.disabledIds;
   const manualTargets = manual.targets;
   const warnedConfigProblems = new Set<string>();
-  const autoTargets = discoverAuto(
+  const { targets: autoTargets, providers: autoProviders } = discoverAuto(
     runtimeConfigSources(),
     disabledIds,
     warnedConfigProblems,
@@ -864,6 +1159,67 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     if (existing.size > 0) pendingRemovals.set(providerID, existing);
   };
 
+  // Merge gap-fill bookkeeping: per-provider catalog row ids whose missing
+  // metadata this plugin gap-filled. Seeded from the state file so a restart
+  // re-applies on catalog replay; replaced after each successful merge cycle.
+  const mergedModelIds = new Map<string, Set<string>>();
+  if (persistedState !== null) {
+    for (const providerID of Object.keys(persistedState.providers)) {
+      const ids = mergedModelIdsFor(persistedState, providerID);
+      if (ids.length > 0) mergedModelIds.set(providerID, new Set(ids));
+    }
+  }
+
+  // Q5: ids with a hand config `models` entry — the host config plugin resets
+  // those rows' variants on rebuild, so merge gap-fill skips them.
+  const configBlockedModelIds = new Map<string, Set<string>>();
+  const rebuildConfigBlocked = (providers: ProviderConfigMap | undefined): void => {
+    configBlockedModelIds.clear();
+    if (providers === undefined) return;
+    for (const [providerID, record] of Object.entries(providers)) {
+      const models = record.models;
+      if (!isRecord(models)) continue;
+      const ids = new Set(Object.keys(models));
+      if (ids.size > 0) configBlockedModelIds.set(providerID, ids);
+    }
+  };
+  rebuildConfigBlocked(autoProviders);
+
+  // Provider ids observed in the live catalog at transform time, with their
+  // integration ids: native (models.dev) providers have no config entry, so
+  // this map is how the merge command addresses them.
+  const catalogProviderInfo = new Map<string, string | undefined>();
+
+  // models.dev registry snapshot for the merge effort join: resolved once per
+  // process, fire-and-forget at setup (no boot block) and awaited by the merge
+  // command. Undefined until the fetch lands; the join contributes nothing
+  // until then. Survives module re-eval via the globalThis cache slot.
+  let registrySnapshot: ReadonlyMap<string, ModelsDevProviderLite> | undefined;
+  void loadModelsDevProviders().then((snapshot) => {
+    registrySnapshot = snapshot;
+  });
+
+  // Toggle-only suppression (provider-docs verdict): a provider whose own
+  // models.dev entry declares a reasoning toggle without effort levels is an
+  // explicit no — importing other providers' (gateway-side) effort lists
+  // would write variants the provider's own API cannot honor.
+  const toggleOnlyProviders = new Set<string>();
+
+  const mergeContext: MergeContext = {
+    mergedModelIds,
+    isConfigBlocked: (providerID, modelID) =>
+      isMergeConfigBlocked(configBlockedModelIds, providerID, modelID),
+    registryJoin: (providerID, modelID) => {
+      if (registrySnapshot === undefined) return undefined;
+      const own = registrySnapshot.get(providerID)?.models?.[modelID];
+      if (isRecord(own) && isToggleOnlyReasoning(own.reasoning_options)) {
+        toggleOnlyProviders.add(providerID);
+        return undefined;
+      }
+      return registryJoinVariants(providerID, modelID, registrySnapshot);
+    },
+  };
+
   const applyPollResults = (results: ReadonlyMap<string, ModelEntry[] | undefined>): void => {
     for (const [providerID, models] of results) {
       if (models === undefined) continue;
@@ -885,6 +1241,19 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       discovered = retainLastGood(discovered, providerID, models);
     }
   };
+
+  /** Stamp merge-cycle entries so the transform gap-fills instead of overriding. */
+  const markMergeResults = (
+    results: ReadonlyMap<string, ModelEntry[] | undefined>,
+  ): ReadonlyMap<string, ModelEntry[] | undefined> =>
+    new Map<string, ModelEntry[] | undefined>(
+      [...results].map(([providerID, models]): [string, ModelEntry[] | undefined] => [
+        providerID,
+        models === undefined
+          ? undefined
+          : models.map((model): MergeModelEntry => ({ ...model, merge: true })),
+      ]),
+    );
 
   let catalogRegistration: CatalogRegistrationLite | undefined;
   const catalogSurface = resolveCatalogSurface(ctx);
@@ -910,13 +1279,18 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       }
       let joinCandidates: readonly CatalogJoinCandidate[] = [];
       try {
-        joinCandidates = buildCatalogJoin(
-          (draft as unknown as CatalogProviderDraftLite).provider.list(),
-        );
+        const providerRecords = (draft as unknown as CatalogProviderDraftLite).provider.list();
+        // Record catalog provider ids (native/models.dev included) so the
+        // merge command can address providers without a config entry.
+        for (const record of providerRecords) {
+          if (typeof record?.provider?.id !== "string") continue;
+          catalogProviderInfo.set(record.provider.id, record.provider.integrationID);
+        }
+        joinCandidates = buildCatalogJoin(providerRecords);
       } catch {
         // A missing catalog snapshot keeps this rebuild name-only.
       }
-      applyDiscovered(draft, discovered, joinCandidates);
+      applyDiscovered(draft, discovered, joinCandidates, mergeContext);
       for (const [providerID, modelIDs] of pendingRemovals) {
         for (const modelID of modelIDs) {
           try {
@@ -976,26 +1350,33 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     }
   }
 
-  type RefreshMode = "normal" | "force" | "watch";
+  type RefreshMode = "normal" | "force" | "watch" | "merge";
 
   const refreshGeneration = async (
     generation: number,
     mode: RefreshMode,
+    providerFilter?: ReadonlySet<string>,
+    extraTargets?: readonly ProviderTarget[],
   ): Promise<RefreshSummary | undefined> => {
     try {
-      const freshAutoTargets = discoverAuto(
+      const { targets: freshAutoTargets, providers: freshProviders } = discoverAuto(
         runtimeConfigSources(),
         disabledIds,
         warnedConfigProblems,
         globalParametersPath,
       );
+      rebuildConfigBlocked(freshProviders);
       const desired = mergeTargets(manualTargets, freshAutoTargets);
       // force bypasses both interval and cache TTL (rescan command); watch skips
       // the interval gate but still respects the TTL (config-file edits); normal
       // requires the interval AND stale-or-unset TTL.
-      const due =
-        mode === "force"
-          ? desired
+      // Merge is force-like: bypass interval + TTL + parameters cache, with
+      // an optional provider filter (merge command targets one provider).
+      let due =
+        mode === "force" || mode === "merge"
+          ? providerFilter === undefined
+            ? desired
+            : desired.filter((target) => providerFilter.has(target.id))
           : computeDueTargets(
               desired,
               lastPolledMs,
@@ -1005,17 +1386,27 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               globalCacheForSeconds,
               mode === "watch",
             );
+      // Native merge targets (models.dev providers, no config entry) join the
+      // due set directly; they are never part of `desired`.
+      if (mode === "merge" && extraTargets !== undefined && extraTargets.length > 0) {
+        due = [...due, ...extraTargets];
+      }
       // Mark attempt time BEFORE polling so failing providers never respin on
       // the next tick; a successful commit is what actually refreshes catalog.
       const attemptedAt = Date.now();
       for (const target of due) lastPolledMs.set(target.id, attemptedAt);
       const storeAuthResolver = createStoreAuthResolver(ctx);
       await enrichTargetsWithStoreAuth(due, storeAuthResolver);
-      const results = await pollAll(due, globalPollTimeoutMs, {
+      // A merge cycle polls with enrichment forced on regardless of the
+      // standing flag, so gap-fill has metadata to fill from.
+      const pollTargets =
+        mode === "merge" ? due.map((target) => ({ ...target, enrich: true as const })) : due;
+      const results = await pollAll(pollTargets, globalPollTimeoutMs, {
         cacheForSeconds: globalCacheForSeconds,
         intervalSeconds: globalIntervalSeconds,
-        bypassParameterCache: mode === "force",
+        bypassParameterCache: mode === "force" || mode === "merge",
       });
+      const mergeResults = mode === "merge" ? markMergeResults(results) : results;
       if (generation !== latestGeneration) return undefined;
 
       const desiredIds = new Set(desired.map((target) => target.id));
@@ -1025,12 +1416,19 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         queueRemovals(target.id, owned);
         ownedModelIds.delete(target.id);
         discovered.delete(target.id);
+        mergedModelIds.delete(target.id);
         console.log(
           `${LOG_PREFIX} Provider "${target.id}" removed from config; dropping ${owned.size} discovered model(s)`,
         );
       }
       targets = desired;
-      applyPollResults(results);
+      applyPollResults(mergeResults);
+      if (mode === "merge") {
+        for (const [providerID, models] of mergeResults) {
+          if (models === undefined) continue;
+          mergedModelIds.set(providerID, new Set(models.map((model) => model.id)));
+        }
+      }
       // Re-fire the catalog transform so the fresh closure map commits. No
       // surface means poll-only mode: clocks and snapshots still advance.
       if (catalogRegistration !== undefined && catalogSurface !== undefined) {
@@ -1049,18 +1447,27 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       // disk error must never fail the refresh.
       if (due.length > 0) {
         try {
-          const trigger: StateTrigger = mode === "force" ? "command" : mode === "watch" ? "watch" : "poll";
+          const trigger: StateTrigger =
+            mode === "force" || mode === "merge" ? "command" : mode === "watch" ? "watch" : "poll";
           if (mode === "force") lastRescanAtMs = Date.now();
           const polledIds = new Set(due.map((target) => target.id));
           const entries = new Map<string, ProviderStateInput>();
-          for (const target of targets) {
+          // Snapshot config targets plus native/rehydrated providers living
+          // in `discovered` (they have no config target to iterate).
+          const stateTargets: Array<{ id: string; cacheForSeconds?: number }> = [...targets];
+          for (const providerID of discovered.keys()) {
+            if (!stateTargets.some((target) => target.id === providerID)) {
+              stateTargets.push({ id: providerID });
+            }
+          }
+          for (const target of stateTargets) {
             const successMs = lastSuccessMs.get(target.id);
             const polledMs = lastPolledMs.get(target.id);
             if (successMs === undefined && polledMs === undefined) continue;
             const entryTrigger = polledIds.has(target.id)
               ? trigger
               : (lastTriggers.get(target.id) ?? trigger);
-            entries.set(target.id, {
+            let entry: ProviderStateInput = {
               lastSuccessMs: successMs,
               lastPolledMs: polledMs,
               modelCount: lastModelCounts.get(target.id) ?? 0,
@@ -1069,7 +1476,12 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               // Persist the payloads too: the catalog is process-local, so a
               // restart inside the TTL rehydrates from here instead of polling.
               models: discovered.get(target.id),
-            });
+            };
+            // mergedModelIds rides every write (not only merge cycles) so a
+            // normal cycle never erases the recorded ids.
+            const mergedIds = mergedModelIds.get(target.id);
+            if (mergedIds !== undefined) entry = withMergedModelIds(entry, [...mergedIds]);
+            entries.set(target.id, entry);
             lastTriggers.set(target.id, entryTrigger);
           }
           if (entries.size > 0) {
@@ -1086,9 +1498,13 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     }
   };
 
-  const scheduleRefresh = (mode: RefreshMode = "normal"): Promise<RefreshSummary | undefined> => {
+  const scheduleRefresh = (
+    mode: RefreshMode = "normal",
+    providerFilter?: ReadonlySet<string>,
+    extraTargets?: readonly ProviderTarget[],
+  ): Promise<RefreshSummary | undefined> => {
     const generation = ++latestGeneration;
-    refreshQueue = refreshQueue.then(() => refreshGeneration(generation, mode));
+    refreshQueue = refreshQueue.then(() => refreshGeneration(generation, mode, providerFilter, extraTargets));
     return refreshQueue;
   };
 
@@ -1097,6 +1513,12 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
    * races. Returns the cycle's summary, or undefined when superseded.
    */
   const forceRefresh = (): Promise<RefreshSummary | undefined> => scheduleRefresh("force");
+
+  /** Merge cycle: force poll (interval+TTL+parameters bypass) with gap-fill semantics. */
+  const mergeRefresh = (
+    providerFilter?: ReadonlySet<string>,
+    extraTargets?: readonly ProviderTarget[],
+  ): Promise<RefreshSummary | undefined> => scheduleRefresh("merge", providerFilter, extraTargets);
 
   /** Immediate refresh that still respects each target's cache TTL. */
   const watchRefresh = (): void => {
@@ -1170,6 +1592,80 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               return;
             }
             ack(formatRescanAck(summary));
+          },
+        });
+        draft.add({
+          name: "models-discovery-merge",
+          description: "Fill missing model metadata (capabilities/limit/variants) now",
+          execute: async (context): Promise<void> => {
+            const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined;
+            const sessionApi = ctx.session;
+            // Best-effort session ack, rescan pattern: never fail the merge
+            // over a missing session surface or a rejected synthetic post.
+            const ack = (text: string): void =>
+              postSyntheticAck(sessionApi, sessionID, "models-discovery-merge", text);
+            // Q1 (live, v2.0.17): prompt.text is exactly the argument, no
+            // command prefix. Empty/whitespace = all config targets.
+            const arg = typeof context?.prompt?.text === "string" ? context.prompt.text.trim() : "";
+            const runMerge = async (
+              label: string,
+              providerFilter: ReadonlySet<string> | undefined,
+              extraTargets?: readonly ProviderTarget[],
+            ): Promise<void> => {
+              toggleOnlyProviders.clear();
+              ack(`Models-discovery merge started for ${label}.`);
+              const summary = await mergeRefresh(providerFilter, extraTargets);
+              if (summary === undefined) {
+                ack("Models-discovery merge superseded by a newer refresh.");
+                return;
+              }
+              ack(formatMergeAck(summary));
+              for (const providerID of toggleOnlyProviders) {
+                ack(
+                  `Provider "${providerID}" exposes no effort levels (thinking toggle only); efforts on other providers are gateway-side mappings.`,
+                );
+              }
+            };
+            const targetIds = new Set(targets.map((target) => target.id));
+            if (arg !== "" && !targetIds.has(arg)) {
+              if (!catalogProviderInfo.has(arg)) {
+                const nativeIds = [...catalogProviderInfo.keys()].filter((id) => !targetIds.has(id));
+                ack(
+                  `Models-discovery merge: unknown provider "${arg}" (not a discovery target). ` +
+                    `Config targets: ${[...targetIds].join(", ") || "(none)"}. ` +
+                    `Native providers: ${nativeIds.join(", ") || "(none)"}.`,
+                );
+                return;
+              }
+              // Native provider (models.dev rows, no config entry): synthesize
+              // the merge target from the cached models.dev registry.
+              const registry = await loadModelsDevProviders();
+              registrySnapshot = registry;
+              const nativeTarget = buildNativeMergeTarget(arg, catalogProviderInfo.get(arg), registry);
+              if (nativeTarget === undefined) {
+                ack(`Models-discovery merge: no models.dev api base for provider "${arg}"; no merge run.`);
+                return;
+              }
+              await runMerge(`native provider "${arg}"`, new Set([arg]), [nativeTarget]);
+              return;
+            }
+            if (arg === "") {
+              await runMergeNoArg({
+                sessionApi,
+                sessionID,
+                targetIds,
+                catalogProviderInfo,
+                configTargetCount: targets.length,
+                runMerge,
+                setRegistry: (registry): void => {
+                  registrySnapshot = registry;
+                },
+              });
+              return;
+            }
+            registrySnapshot = await loadModelsDevProviders();
+            await runMerge(`provider "${arg}"`, new Set([arg]));
+            return;
           },
         });
       });

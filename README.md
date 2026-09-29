@@ -101,6 +101,7 @@ An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) 
 - A successful empty poll removes previously discovered models; models you registered yourself are never touched.
 - Your own model names are preserved — the plugin only names a model when none exists.
 - The `models-discovery-rescan` command posts session acknowledgements: a "started" message immediately, then a sanitized summary (`N model(s) across M provider(s)`, plus any providers that failed and kept their last known models) when the cycle completes. Invocations without a session stay silent.
+- The `models-discovery-merge` command (`/models-discovery-merge <provider>`) fills ONLY missing metadata fields — it never overwrites an existing `capabilities`/`limit`/`variants` value. It accepts a config discovery target id or a native (models.dev) provider id; with no argument it merges all config targets (native providers need an explicit id). Acks are session-visible and headless invocations stay silent, same as rescan.
 - `cacheFor` gates on the last **successful** poll; caching never delays recovery. The `models-discovery-rescan` command bypasses interval and TTL.
 - Config edits apply via the config-file watch (~0.5 s debounce) or the next poll cycle.
 - Refreshes are serialized with a generation guard: a slow poll can't commit stale results over a newer one.
@@ -134,6 +135,17 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
 - Never stores credentials or URLs — timestamps, counts, trigger, TTL, and the discovered model payloads (ids, names, enrichment metadata) only.
 - A `version: 1` file (clocks only) is ignored: the upgrade path is one cold-start poll cycle, which rewrites it as `version: 2`.
 
+## Merge command
+
+`/models-discovery-merge <provider>` runs a one-shot discovery poll with enrichment forced on, then gap-fills the catalog rows for that provider: a field is assigned only when the row lacks it entirely.
+
+- **Provider argument**: a config discovery target id, or a native provider id (models.dev rows with no config entry — the command learns these from the live catalog). With no argument the command first infers the provider from the session's **active model** (read through the session surface); if that resolves to a known provider — a config target or a native one — only that provider is merged. Otherwise (headless invocation, unreadable or unset model, unknown provider) it falls back to merging all config targets. Unknown ids get a sanitized ack listing both kinds.
+- **Native providers**: the poll target is synthesized from the public models.dev registry (base URL, API-key env hint, integration id from the catalog record) and uses the same credential chain as normal polling (config `apiKey` → `apiKeyEnv` → credential store). The registry is fetched once per process and cached.
+- **Effort join**: when a provider's own `/models` response is bare (ids only) but other providers in the models.dev registry define reasoning efforts for the same model ids, those effort variants fill the row's missing `variants` (first non-empty definition wins; existing fields, including a toggle, are never touched). When the provider's own models.dev entry declares a reasoning toggle without effort levels (an explicit no-effort statement), the join is suppressed for that provider — the merge ack says so explicitly.
+- **Persistence + re-apply**: the ids touched per provider are recorded in the state file (`mergedModelIds`, a v2-additive field; older files load as empty) and re-applied on restart when the catalog replays.
+- **Config-declared models are skipped**: the host's config plugin re-assigns hand-configured `models` entries after plugin transforms, so merging those rows is futile — config wins by host design. Config-side variant persistence is a follow-up.
+- **Seeing the result**: the TUI caches the resolved model at selection time — reopen the model picker after a merge to see new efforts.
+
 ## Limitations
 
 - opencode v2 line only (beta through stable 2.x); one build spans them via
@@ -143,6 +155,11 @@ The plugin snapshots poll clocks and counts to `${XDG_STATE_HOME:-~/.local/state
   running) with a loud warn, never a silent abort. Pin a commit for stability.
 - Enrichment quality depends on the provider — bare `/models` listings fall back to name-only catalog enrichment.
 - `parametersPath` endpoints (e.g. Bifrost's `/api/models/parameters`) are management endpoints and may be RBAC-protected; without permission models keep join/name-only enrichment.
+- Merge cannot verify that a provider's chat API actually accepts effort parameters — it only fills the catalog fields; a request-time rejection is possible and not detectable from `/models`.
+- A model that vanishes from the provider's list keeps its gap-filled fields (fill-only semantics; removal cleanup only covers plugin-owned models).
+- If the host maps a provider's reasoning toggle into an existing `variants` value, merge will not add efforts to that row — it never overwrites.
+- The merge command registers only when at least one discovery target is configured; a zero-target setup is a no-op plugin.
+- A provider whose own API documents no effort parameter (thinking toggle only — e.g. xiaomi's chat completions) receives no imported effort variants: models.dev effort lists under other providers are gateway-side mappings, not native capabilities, and the provider's chat API may reject `reasoning_effort` requests.
 
 ## Development
 
