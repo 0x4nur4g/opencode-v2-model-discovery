@@ -11,5 +11,5 @@
     "allowImportingTsExtensions": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts", "types.ts", "smoke.ts", "core.ts", "seconds.ts", "config.ts", "metadata.ts", "runtime.ts"]
+  "include": ["index.ts", "types.ts", "smoke.ts", "core.ts", "seconds.ts", "config.ts", "metadata.ts", "runtime.ts", "tui.tsx", "state.ts", "bin/**/*.ts"]
 }

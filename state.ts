@@ -7,7 +7,7 @@
 // seeds clocks + models at startup and records successful cycles. Never
 // credentials.
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
 import { homedir } from "node:os";
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
@@ -17,6 +17,9 @@ import { parseModelMetadata } from "./metadata.ts";
 import type { ModelEntry } from "./metadata.ts";
 
 export const STATE_FILE_ENV = "OPENCODE_MODELS_DISCOVERY_STATE_FILE";
+
+/** Override for the rescan trigger file (see resolveTriggerFilePath). */
+export const TRIGGER_FILE_ENV = "OPENCODE_MODELS_DISCOVERY_TRIGGER_FILE";
 
 export const STATE_FILE_VERSION = 2;
 
@@ -29,10 +32,23 @@ export interface ProviderStateEntry {
   modelCount: number;
   cacheForSeconds: number | null;
   lastTrigger: StateTrigger;
+  /** Last sanitized poll failure; absent after a successful poll. */
+  lastError?: ProviderStateError;
   /** Last discovered payloads; absent/empty means nothing to rehydrate. */
   models?: ModelEntry[];
   /** Catalog row ids whose metadata this plugin merged; re-applied on restart. */
   mergedModelIds?: string[];
+}
+
+/**
+ * Sanitized poll failure for the state file: a marker (`poll`, `poll-timeout`,
+ * `status`, `response-parse`, `response-shape`, `pagination`) plus an HTTP
+ * status when one exists. Never carries URLs, bodies, or credentials.
+ */
+export interface ProviderStateError {
+  marker: string;
+  status?: number;
+  at: string; // ISO
 }
 
 export interface DiscoveryStateFile {
@@ -47,6 +63,7 @@ export interface ProviderStateInput {
   modelCount: number;
   cacheForSeconds: number | null;
   lastTrigger: StateTrigger;
+  lastError?: ProviderStateError;
   models?: readonly ModelEntry[];
   mergedModelIds?: readonly string[];
 }
@@ -62,6 +79,35 @@ export function resolveStateFilePath(env: Record<string, string | undefined> = p
   const stateRoot =
     xdgState !== undefined && xdgState.trim() !== "" ? xdgState.trim() : join(homedir(), ".local", "state");
   return join(stateRoot, "opencode", "model-discovery", "state.json");
+}
+
+/**
+ * Rescan trigger file: the only scriptable refresh path (the host treats
+ * `opencode run "/command"` as a prompt, so slash commands never dispatch
+ * headless). The plugin checks it once per scheduler tick, deletes it, and
+ * runs a force cycle. Defaults next to the state file.
+ */
+export function resolveTriggerFilePath(
+  statePath: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const override = env[TRIGGER_FILE_ENV];
+  if (override !== undefined && override.trim() !== "") return resolve(override.trim());
+  return join(dirname(statePath), "refresh-request");
+}
+
+/**
+ * Consume a pending trigger file: true when one was present and removed.
+ * A read-only state directory degrades to "no trigger", never an error.
+ */
+export function consumeTriggerFile(path: string): boolean {
+  try {
+    if (!existsSync(path)) return false;
+    rmSync(path, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -95,6 +141,20 @@ function parseMergedModelIds(value: unknown): string[] | undefined {
   return ids.length > 0 ? ids : undefined;
 }
 
+/** Tolerant parse of lastError: absent or malformed reads as none. */
+function parseStateError(value: unknown): ProviderStateError | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.marker !== "string" || value.marker.trim() === "") return undefined;
+  if (typeof value.at !== "string" || !Number.isFinite(Date.parse(value.at))) return undefined;
+  const status =
+    typeof value.status === "number" && Number.isInteger(value.status) ? value.status : undefined;
+  return {
+    marker: value.marker,
+    ...(status !== undefined ? { status } : {}),
+    at: value.at,
+  };
+}
+
 function parseEntry(value: unknown): ProviderStateEntry | null {
   if (!isRecord(value)) return null;
   const { lastSuccessAt, lastPolledAt, modelCount, cacheForSeconds, lastTrigger } = value;
@@ -105,12 +165,14 @@ function parseEntry(value: unknown): ProviderStateEntry | null {
   if (!STATE_TRIGGERS.includes(lastTrigger as StateTrigger)) return null;
   const models = parseModels(value.models);
   const mergedModelIds = parseMergedModelIds(value.mergedModelIds);
+  const lastError = parseStateError(value.lastError);
   return {
     lastSuccessAt,
     lastPolledAt,
     modelCount,
     cacheForSeconds,
     lastTrigger: lastTrigger as StateTrigger,
+    ...(lastError !== undefined ? { lastError } : {}),
     ...(models !== undefined ? { models } : {}),
     ...(mergedModelIds !== undefined ? { mergedModelIds } : {}),
   };
@@ -163,6 +225,7 @@ export function buildStateFile(
       modelCount: input.modelCount,
       cacheForSeconds: input.cacheForSeconds,
       lastTrigger: input.lastTrigger,
+      ...(input.lastError !== undefined ? { lastError: input.lastError } : {}),
       ...(models !== undefined && models.length > 0 ? { models: [...models] } : {}),
       ...(input.mergedModelIds !== undefined && input.mergedModelIds.length > 0
         ? { mergedModelIds: [...input.mergedModelIds] }

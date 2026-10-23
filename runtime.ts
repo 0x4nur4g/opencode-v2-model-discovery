@@ -6,18 +6,24 @@ import { existsSync, readFileSync, watch } from "node:fs";
 import { homedir } from "node:os";
 
 import {
+  DEFAULT_PAGINATION_MAX_PAGES,
   DEFAULT_POLL_INTERVAL_SECONDS,
   LOG_PREFIX,
+  MAX_PAGINATION_PAGES,
   POLL_TIMEOUT_MS,
+  POLL_TOTAL_TIMEOUT_MULTIPLIER,
   TICK_MS,
   createWarnState,
   errorName,
   isRecord,
   isTruthyEnv,
+  resolveBackgroundBoot,
+  resolveBackgroundDeferMs,
   safeFailure,
   watchWarns,
 } from "./core.ts";
 import {
+  resolveAuthBackoffSeconds,
   resolveCacheForSeconds,
   resolveIntervalSeconds,
   resolvePollTimeoutSeconds,
@@ -52,20 +58,28 @@ import {
   type CatalogProviderRecordLite,
   type ModelCapabilitiesLite,
   type ModelEntry,
+  type ModelEnrichmentResolution,
   type ModelLimitLite,
   type ModelMetadata,
   type ModelVariantLite,
 } from "./metadata.ts";
 import {
   buildStateFile,
+  consumeTriggerFile,
   loadStateFile,
   mergedModelIdsFor,
   resolveStateFilePath,
+  resolveTriggerFilePath,
   withMergedModelIds,
   writeStateFile,
+  type ProviderStateError,
   type ProviderStateInput,
   type StateTrigger,
 } from "./state.ts";
+import {
+  experientialCatalogURL,
+  fetchExperientialRouteEfforts,
+} from "./experiential.ts";
 
 type Cleanup = CleanupLite;
 
@@ -293,6 +307,21 @@ export interface ParametersPollContext {
   readonly cacheForSeconds?: number;
   readonly intervalSeconds?: number;
   readonly bypassParameterCache?: boolean;
+  /** Force-mode (rescan command) bypass for the experiential catalog TTL. */
+  readonly bypassCatalogTtl?: boolean;
+  /** Sanitized per-provider failure sink for acks and the state file. */
+  readonly onFailure?: (providerID: string, failure: PollFailure) => void;
+}
+
+/** Sanitized poll failure: a marker plus an HTTP status when one exists. */
+export interface PollFailure {
+  readonly marker: string;
+  readonly status?: number;
+}
+
+/** A poll failure attributed to one provider id (ack/state surfaces). */
+export interface ProviderPollFailure extends PollFailure {
+  readonly providerID: string;
 }
 
 /** Per-model parameters cache: provider id + model id -> fetched parameters contributions. */
@@ -389,10 +418,171 @@ async function loadParametersMetadata(
 }
 
 /**
+ * Stall guard for one HTTP exchange. The timer aborts only after `stallMs` with
+ * no progress (headers or body bytes); a hard ceiling of
+ * POLL_TOTAL_TIMEOUT_MULTIPLIER x stallMs still stops a slow-drip body from
+ * holding the serialized refresh queue open.
+ */
+interface StallGuard {
+  readonly signal: AbortSignal;
+  /** Reset the inactivity window after progress. */
+  readonly arm: () => void;
+  /** Clear both timers once the exchange is done. */
+  readonly release: () => void;
+  /** Why the guard aborted, if it did. */
+  readonly reason: () => "stall" | "total" | undefined;
+}
+
+function createStallGuard(stallMs: number): StallGuard {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let reason: "stall" | "total" | undefined;
+  const total = setTimeout(() => {
+    if (reason === undefined) reason = "total";
+    controller.abort();
+  }, stallMs * POLL_TOTAL_TIMEOUT_MULTIPLIER);
+  const arm = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (reason === undefined) reason = "stall";
+      controller.abort();
+    }, stallMs);
+  };
+  arm();
+  return {
+    signal: controller.signal,
+    arm,
+    release: () => {
+      if (timer !== undefined) clearTimeout(timer);
+      clearTimeout(total);
+    },
+    reason: () => reason,
+  };
+}
+
+/**
+ * Read the body under the stall guard and parse it. Returns `{ok:false}` for
+ * both an aborted read and malformed JSON; the caller separates them with
+ * `guard.reason()` so an abort never reads as a parse error.
+ */
+async function readResponseJson(
+  response: Response,
+  guard: StallGuard,
+): Promise<{ ok: true; value: unknown } | { ok: false; phase: "read" | "parse" }> {
+  let text = "";
+  let bytes = 0;
+  try {
+    const body = response.body;
+    if (body !== null && typeof body?.getReader === "function") {
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        guard.arm();
+        if (chunk.value !== undefined) {
+          bytes += chunk.value.byteLength;
+          text += decoder.decode(chunk.value, { stream: true });
+        }
+      }
+      text += decoder.decode();
+    } else {
+      text = await response.text();
+      bytes = text.length;
+    }
+  } catch {
+    return { ok: false, phase: "read" };
+  }
+  // A body shorter than its declared Content-Length is a truncated transfer,
+  // not malformed JSON — report the transport, not the parser.
+  const declared = Number(response.headers?.get?.("content-length") ?? Number.NaN);
+  if (Number.isFinite(declared) && declared > 0 && bytes < declared) {
+    return { ok: false, phase: "read" };
+  }
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false, phase: "parse" };
+  }
+}
+
+/** Outcome of one page fetch: parsed JSON or a sanitized failure marker. */
+type PageOutcome =
+  | { readonly ok: true; readonly value: unknown; readonly status: number }
+  | {
+      readonly ok: false;
+      readonly marker: string;
+      readonly status?: number;
+      /** True for malformed JSON (as opposed to an abort or a non-2xx). */
+      readonly parseFailed: boolean;
+    };
+
+async function fetchModelsPage(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<PageOutcome> {
+  const guard = createStallGuard(timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, signal: guard.signal });
+  } catch {
+    const timedOut = guard.reason() !== undefined;
+    guard.release();
+    return { ok: false, marker: timedOut ? "poll-timeout" : "poll", parseFailed: false };
+  }
+  if (!response.ok) {
+    guard.release();
+    return { ok: false, marker: "status", status: response.status, parseFailed: false };
+  }
+  const parsed = await readResponseJson(response, guard);
+  const timedOut = guard.reason() !== undefined;
+  guard.release();
+  if (!parsed.ok) {
+    if (timedOut) {
+      return { ok: false, marker: "poll-timeout", status: response.status, parseFailed: false };
+    }
+    // A read failure (connection cut mid-body) is a transport problem, not
+    // malformed JSON; only an actual JSON.parse failure is response-parse.
+    if (parsed.phase === "read") {
+      return { ok: false, marker: "poll", status: response.status, parseFailed: false };
+    }
+    return { ok: false, marker: "response-parse", status: response.status, parseFailed: true };
+  }
+  return { ok: true, value: parsed.value, status: response.status };
+}
+
+/** Apply configured query parameters and pagination to one poll URL. */
+function buildPollURL(base: string, target: ProviderTarget, page: number): string {
+  const pagination = target.pagination;
+  if (target.query === undefined && pagination === undefined) return base;
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    return base;
+  }
+  for (const [key, value] of Object.entries(target.query ?? {})) {
+    url.searchParams.set(key, value);
+  }
+  if (pagination !== undefined) {
+    if (pagination.perPage !== undefined && pagination.perPageParam !== undefined) {
+      url.searchParams.set(pagination.perPageParam, String(pagination.perPage));
+    }
+    url.searchParams.set(pagination.pageParam, String(page));
+  }
+  return url.toString();
+}
+
+/**
  * Poll one provider. Undefined result means keep the previous discovered list.
  * Timeout precedence: the target's per-provider pollTimeoutMs (auto targets)
- * > the caller's fallbackTimeoutMs > the 20s default. When the target opts
- * into a parameters endpoint, models still lacking effort variants after the
+ * > the caller's fallbackTimeoutMs > the 20s default. The timeout is a STALL
+ * window (abort only after this long with no bytes) with a hard ceiling of
+ * POLL_TOTAL_TIMEOUT_MULTIPLIER x this value for the whole exchange.
+ * When the target opts into pagination, pages are walked until a short/empty
+ * page, the page cap, or a repeated page. When the target opts into a
+ * parameters endpoint, models still lacking effort variants after the
  * standard pass get one lazy per-model parameters fetch using the same auth;
  * that single fetch also backfills the limit and capabilities fields the
  * standard pass did not supply.
@@ -410,41 +600,97 @@ export async function pollProvider(
   };
   const headers: Record<string, string> = { ...(target.headers ?? {}), ...buildAuthHeaders() };
   const timeoutMs = target.pollTimeoutMs ?? fallbackTimeoutMs ?? POLL_TIMEOUT_MS;
+  const report = (marker: string, status?: number): void => {
+    parameters?.onFailure?.(
+      target.id,
+      status === undefined ? { marker } : { marker, status },
+    );
+  };
 
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      headers,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch {
-    safeFailure("poll", target.id);
-    return undefined;
+  const pagination = target.pagination;
+  const maxPages =
+    pagination === undefined
+      ? 1
+      : Math.min(
+          MAX_PAGINATION_PAGES,
+          Math.max(1, Math.trunc(pagination.maxPages ?? DEFAULT_PAGINATION_MAX_PAGES)),
+        );
+  const collected: ModelEntry[] = [];
+  const seenIds = new Set<string>();
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const pageURL = buildPollURL(url, target, page);
+    const outcome = await fetchModelsPage(pageURL, headers, timeoutMs);
+    if (!outcome.ok) {
+      // Any page failure fails the poll: a partial multi-page catalog would
+      // read as "these models vanished" and remove them from the catalog.
+      if (outcome.parseFailed && page > 1) {
+        safeFailure("pagination", target.id, outcome.status);
+      } else {
+        safeFailure(
+          outcome.marker === "status" || outcome.marker === "poll-timeout" ? "poll" : outcome.marker,
+          target.id,
+          outcome.status,
+        );
+      }
+      report(outcome.marker, outcome.status);
+      return undefined;
+    }
+
+    const entries = extractEntries(outcome.value, target.enrich === true);
+    if (entries === undefined) {
+      safeFailure("response-shape", target.id, outcome.status);
+      report("response-shape", outcome.status);
+      return undefined;
+    }
+    let added = 0;
+    for (const entry of entries) {
+      if (seenIds.has(entry.id)) continue;
+      seenIds.add(entry.id);
+      collected.push(entry);
+      added += 1;
+    }
+    if (pagination === undefined) break;
+    // Stop on an empty page, a short page (a full-size page means "more"), or
+    // a page that only repeated ids already seen (providers that ignore the
+    // page parameter would otherwise be fetched maxPages times).
+    if (entries.length === 0 || added === 0) break;
+    if (pagination.perPage !== undefined && entries.length < pagination.perPage) break;
   }
 
-  if (!response.ok) {
-    safeFailure("poll", target.id, response.status);
-    return undefined;
-  }
-
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    safeFailure("response-parse", target.id, response.status);
-    return undefined;
-  }
-
-  const entries = extractEntries(body, target.enrich === true);
-  if (entries === undefined) {
-    safeFailure("response-shape", target.id, response.status);
-    return undefined;
-  }
-
-  const filtered = entries.filter((entry) => entryMatches(entry, target.filter));
+  const filtered = collected.filter((entry) => entryMatches(entry, target.filter));
   const result = target.enrich
     ? filtered.map((entry) => ({ ...entry, enrich: true as const }))
     : filtered;
+
+  // Experiential Labs public catalog: the gateway's bare /models listing gets
+  // effort data from one keyless catalog lookup per poll (never per entry),
+  // only for enrich-enabled targets on that exact host. A catalog failure
+  // never fails the poll: models still return with whatever metadata they had.
+  if (target.enrich === true) {
+    const catalogURL = experientialCatalogURL(target.baseURL);
+    if (catalogURL !== undefined) {
+      const routeEfforts = await fetchExperientialRouteEfforts(catalogURL, timeoutMs, {
+        bypassTtl: parameters?.bypassCatalogTtl === true,
+      });
+      if (routeEfforts !== undefined) {
+        for (const entry of result) {
+          const route = routeEfforts.get(entry.id);
+          if (route === undefined) continue;
+          const metadata: ModelMetadata = entry.metadata ?? {};
+          if (route.denied) {
+            // Explicit deny: the default route declares no usable efforts, so
+            // guessed models.dev join variants must not be presented for it.
+            metadata.reasoningDenied = true;
+          } else {
+            const variants = mergeVariants(metadata.variants, effortVariants(route.efforts));
+            if (variants !== undefined) metadata.variants = variants;
+          }
+          (entry as { metadata?: ModelMetadata }).metadata = metadata;
+        }
+      }
+    }
+  }
 
   if (typeof target.parametersPath === "string" && target.parametersPath.length > 0) {
     for (const entry of result) {
@@ -729,7 +975,10 @@ async function resolveActiveSessionModel(
   return undefined;
 }
 
-/** Best-effort synthetic session ack: never throws, never rejects. */
+/**
+ * Best-effort synthetic session ack: never throws, never rejects.
+ * `resume: false` keeps the note inbox-only — it never schedules a run.
+ */
 function postSyntheticAck(
   sessionApi: PluginContextLite["session"] | undefined,
   sessionID: string | undefined,
@@ -742,11 +991,27 @@ function postSyntheticAck(
       sessionID,
       text: `${text} [${new Date().toISOString()}]`,
       description,
+      resume: false,
     });
     if (posted && typeof posted.catch === "function") posted.catch(() => {});
   } catch {
     // Ack is cosmetic; a failing ack surface must not break the scan.
   }
+}
+
+/**
+ * True when a credential resolves for this poll: config apiKey, a set
+ * apiKeyEnv, or a store credential attached this cycle. A provider that
+ * declares no credential at all reads as false, so `requireAuth` skips it.
+ */
+function hasResolvedAuth(target: ProviderTarget): boolean {
+  if (target.apiKey !== undefined && target.apiKey !== "") return true;
+  if (target.storeAuth !== undefined && target.storeAuth !== "") return true;
+  if (target.apiKeyEnv !== undefined) {
+    const value = process.env[target.apiKeyEnv];
+    return value !== undefined && value !== "";
+  }
+  return false;
 }
 
 /** Per-cycle store resolver: each provider id resolves at most once per cycle. */
@@ -796,12 +1061,25 @@ export function setImmediateRefreshHook(hook: (() => void) | undefined): void {
 export interface RefreshSummary {
   /** "complete" = cycle ran (per-provider failures are in `failed`); "error" = cycle threw. */
   outcome: "complete" | "error";
-  /** Targets polled this cycle. */
+  /** Targets polled this cycle (skipped targets are not counted). */
   polled: number;
   /** providerID → discovered model count, successful polls only. */
   discoveredCounts: Array<[string, number]>;
   /** Provider ids whose poll failed this cycle; last-good is kept for them. */
   failed: string[];
+  /** Sanitized markers for failed providers (ids, markers, statuses only). */
+  failures?: ProviderPollFailure[];
+  /** Provider ids that already had models before this cycle. */
+  withModels?: string[];
+  /** Provider ids skipped because requireAuth found no credential. */
+  skipped?: string[];
+}
+
+/** Extra per-cycle context the ack surfaces can render. */
+export interface RefreshSummaryExtras {
+  readonly failures?: readonly ProviderPollFailure[];
+  readonly withModels?: readonly string[];
+  readonly skipped?: readonly string[];
 }
 
 /**
@@ -811,33 +1089,82 @@ export interface RefreshSummary {
 export function buildRefreshSummary(
   due: readonly { id: string }[],
   results: ReadonlyMap<string, readonly ModelEntry[] | undefined>,
+  extras?: RefreshSummaryExtras,
 ): RefreshSummary {
   const discoveredCounts: Array<[string, number]> = [];
   const failed: string[] = [];
+  const skippedIds = new Set(extras?.skipped ?? []);
   for (const target of due) {
+    if (skippedIds.has(target.id)) continue;
     const models = results.get(target.id);
     if (models === undefined) failed.push(target.id);
     else discoveredCounts.push([target.id, models.length]);
   }
-  return { outcome: "complete", polled: due.length, discoveredCounts, failed };
+  return {
+    outcome: "complete",
+    polled: due.length - (extras?.skipped?.length ?? 0),
+    discoveredCounts,
+    failed,
+    ...(extras?.failures !== undefined ? { failures: [...extras.failures] } : {}),
+    ...(extras?.withModels !== undefined ? { withModels: [...extras.withModels] } : {}),
+    ...(extras?.skipped !== undefined ? { skipped: [...extras.skipped] } : {}),
+  };
 }
 
-/** Format a rescan ack message; sanitized (ids and counts only, never errors). */
+/**
+ * Sanitized failure detail: provider id plus marker and HTTP status when one
+ * exists (`cbcn (status=401)`, `featherless (poll-timeout)`). Key material,
+ * URLs, and response bodies never reach this string.
+ */
+function failureDetails(summary: RefreshSummary): string[] {
+  const failed = new Set(summary.failed);
+  return (summary.failures ?? [])
+    .filter((failure) => failed.has(failure.providerID))
+    .map((failure) => {
+      if (failure.status === undefined) return `${failure.providerID} (${failure.marker})`;
+      // An HTTP status is the whole story for a non-2xx; avoid "status, status=".
+      if (failure.marker === "status") return `${failure.providerID} (status=${failure.status})`;
+      return `${failure.providerID} (${failure.marker}, status=${failure.status})`;
+    });
+}
+
+/** Failure clauses shared by the rescan and merge acks. */
+function failureClauses(summary: RefreshSummary): string[] {
+  const parts: string[] = [];
+  if (summary.failed.length > 0) {
+    if (summary.withModels !== undefined) {
+      // Distinguish "kept last known" from "failed with nothing to keep": the
+      // old wording implied stale models were retained when none existed.
+      const withModels = new Set(summary.withModels);
+      const kept = summary.failed.filter((id) => withModels.has(id));
+      const none = summary.failed.filter((id) => !withModels.has(id));
+      if (kept.length > 0) parts.push(`Failed, kept last known: ${kept.join(", ")}.`);
+      if (none.length > 0) parts.push(`Failed, no previous models: ${none.join(", ")}.`);
+    } else {
+      parts.push(`Failed, kept last known: ${summary.failed.join(", ")}.`);
+    }
+  }
+  const details = failureDetails(summary);
+  if (details.length > 0) parts.push(`Failures: ${details.join("; ")}.`);
+  if (summary.skipped !== undefined && summary.skipped.length > 0) {
+    parts.push(`Skipped (no credentials): ${summary.skipped.join(", ")}.`);
+  }
+  return parts;
+}
+
+/** Format a rescan ack message; sanitized (ids, markers, and counts only). */
 export function formatRescanAck(summary: RefreshSummary): string {
   if (summary.outcome === "error") {
     return "Models-discovery rescan failed; previous models kept. Check server logs.";
   }
   const total = summary.discoveredCounts.reduce((sum, [, count]) => sum + count, 0);
-  const parts = [
+  return [
     `Models-discovery rescan complete: ${total} model(s) across ${summary.discoveredCounts.length} provider(s).`,
-  ];
-  if (summary.failed.length > 0) {
-    parts.push(`Failed, kept last known: ${summary.failed.join(", ")}.`);
-  }
-  return parts.join(" ");
+    ...failureClauses(summary),
+  ].join(" ");
 }
 
-/** Format a merge ack message; sanitized (ids and counts only, never errors). */
+/** Format a merge ack message; sanitized (ids, markers, and counts only). */
 export function formatMergeAck(summary: RefreshSummary): string {
   if (summary.outcome === "error") {
     return "Models-discovery merge failed; previous models kept. Check server logs.";
@@ -845,13 +1172,12 @@ export function formatMergeAck(summary: RefreshSummary): string {
   const total = summary.discoveredCounts.reduce((sum, [, count]) => sum + count, 0);
   const parts = [
     `Models-discovery merge complete: ${total} model(s) across ${summary.discoveredCounts.length} provider(s) checked for missing metadata.`,
+    ...failureClauses(summary),
   ];
-  if (summary.failed.length > 0) {
-    parts.push(`Failed, kept last known: ${summary.failed.join(", ")}.`);
-  }
   // The TUI caches the resolved model at selection time (verified v2.0.17):
-  // the picker must be reopened to see newly gap-filled efforts.
-  parts.push("Reopen the TUI model picker to see the new efforts.");
+  // the picker must be reopened to see newly gap-filled efforts. The "if a
+  // TUI is open" clause keeps it honest for headless sessions.
+  parts.push("Reopen the TUI model picker (if a TUI is open) to see the new efforts.");
   return parts.join(" ");
 }
 
@@ -861,7 +1187,8 @@ export function formatMergeAck(summary: RefreshSummary): string {
  * TTL is configured, its last SUCCESSFUL poll is at least that old: the TTL
  * gates on success only, so failed polls never delay their next interval
  * retry. skipInterval drops the interval gate (config-watch refresh) while
- * keeping the TTL gate.
+ * keeping the TTL gate. `blockedUntilMs` pauses providers after an auth
+ * failure (401/403) until the deadline passes.
  */
 export function computeDueTargets(
   targets: readonly ProviderTarget[],
@@ -871,8 +1198,11 @@ export function computeDueTargets(
   lastSuccessMs: ReadonlyMap<string, number> = new Map(),
   globalCacheForSeconds?: number,
   skipInterval = false,
+  blockedUntilMs: ReadonlyMap<string, number> = new Map(),
 ): ProviderTarget[] {
   return targets.filter((target) => {
+    const blockedUntil = blockedUntilMs.get(target.id);
+    if (blockedUntil !== undefined && blockedUntil > now) return false;
     const cacheForSeconds = target.cacheForSeconds ?? globalCacheForSeconds;
     if (skipInterval) {
       if (cacheForSeconds === undefined) return true;
@@ -1014,6 +1344,22 @@ function isToggleOnlyReasoning(value: unknown): boolean {
 }
 
 /**
+ * Merge-branch registryJoin eligibility: the models.dev join may fill variants
+ * only when the resolution supplied none and neither the resolution nor the
+ * entry carries an explicit deny marker. An UNKNOWN route contributes no
+ * marker, so candidates stay available there; a deny marker blocks the guess.
+ */
+function registryJoinEligible(
+  resolution: ModelEnrichmentResolution | undefined,
+  modelEntry: ModelEntry,
+): boolean {
+  if (resolution?.metadata?.variants !== undefined) return false;
+  if (resolution?.metadata?.reasoningDenied === true) return false;
+  if (modelEntry.metadata?.reasoningDenied === true) return false;
+  return true;
+}
+
+/**
  * Catalog transform body: read the closure map and enrich matching models.
  * Per-model try/catch: a model missing from the draft or a rejecting update
  * must not abort the remaining updates. Enrichment fields are assigned only
@@ -1049,8 +1395,10 @@ export function applyDiscovered(
               let fill = resolution;
               // Bare /models with an ambiguous (or empty) catalog join: the
               // models.dev registry join supplies effort variants other
-              // providers define for the same model id.
-              if (resolution.metadata?.variants === undefined) {
+              // providers define for the same model id. An explicit deny from
+              // the provider's route catalog suppresses that guess — the route
+              // is known and declares no usable efforts.
+              if (registryJoinEligible(resolution, modelEntry)) {
                 const joined = merge?.registryJoin?.(providerID, modelEntry.id);
                 if (joined !== undefined) {
                   fill = {
@@ -1089,6 +1437,9 @@ export async function setup(ctx: PluginContextLite): Promise<Cleanup | void> {
 }
 
 async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
+  const bootT0 = Date.now();
+  let bootCatMs = -1;
+  let bootCmdMs = -1;
   // Parameters path precedence: plugin options > env. Per-provider overrides
   // (modelsDiscovery.parametersPath) are stored on targets at selection time.
   const globalParametersPath = resolveParametersPath(
@@ -1117,6 +1468,26 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     return;
   }
 
+  // Boot mode precedence: plugin option `background` > env
+  // OPENCODE_MODELS_DISCOVERY_BACKGROUND > default background. Background is
+  // the default because the host gates plugin activation on setup resolving:
+  // awaiting the initial poll below held that gate open for the poll's whole
+  // network time and 503'd the model catalog when a provider was slow.
+  const backgroundBoot = resolveBackgroundBoot(
+    ctx.options.background,
+    process.env.OPENCODE_MODELS_DISCOVERY_BACKGROUND,
+  );
+  // Background boot defers the first catalog APPLICATION past the host's
+  // boot-time rebuilds: one application of a rehydrated payload costs the
+  // host seconds of per-model draft writes, and the host rebuilds several
+  // times while booting, so applying eagerly re-pays that on the critical
+  // path. The deferred kickoff arms the body and runs the first cycle.
+  const backgroundDeferMs = resolveBackgroundDeferMs(
+    ctx.options.backgroundDeferMs,
+    process.env.OPENCODE_MODELS_DISCOVERY_BACKGROUND_DEFER_MS,
+  );
+  let applying = !backgroundBoot;
+
   // Interval precedence: per-provider (stored on auto targets at selection
   // time) > plugin options > env > default. Manual targets use the global.
   const globalIntervalSeconds = resolveIntervalSeconds(
@@ -1143,13 +1514,38 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       process.env.OPENCODE_MODELS_DISCOVERY_POLL_TIMEOUT_SECONDS,
     ) * 1000;
 
+  // requireAuth: plugin option > env > off. Per-provider
+  // `modelsDiscovery.requireAuth` overrides this (parsed onto the target).
+  const globalRequireAuth =
+    typeof ctx.options.requireAuth === "boolean"
+      ? ctx.options.requireAuth
+      : isTruthyEnv(process.env.OPENCODE_MODELS_DISCOVERY_REQUIRE_AUTH);
+
+  // Auth-failure pause: options > env > 30 min; 0 disables the pause.
+  const authBackoffMs =
+    resolveAuthBackoffSeconds(
+      ctx.options.authBackoffSeconds,
+      process.env.OPENCODE_MODELS_DISCOVERY_AUTH_BACKOFF_SECONDS,
+    ) * 1000;
+
   // Discovery state file: disk snapshot of clocks/counts (never credentials).
   // Missing/corrupt/v1-mismatched file is ignored; in-memory maps stay the
   // source of truth.
   const statePath = resolveStateFilePath();
   const persistedState = loadStateFile(statePath);
+  // Scriptable refresh: the host never dispatches `opencode run "/command"`,
+  // so a trigger file next to the state file is the CLI path (see bin/).
+  const triggerPath = resolveTriggerFilePath(statePath);
 
   let discovered = new Map<string, ModelEntry[]>();
+  // Transform fast-path bookkeeping: the host re-runs the catalog transform on
+  // every rebuild, and with a rehydrated payload each full application cost
+  // 5-12s (1379 rows x per-model draft calls). `stateVersion` bumps whenever
+  // the closure state changes (poll results, registry join); the transform
+  // then skips re-application until the next change, unless a probe shows the
+  // draft lost our rows.
+  let stateVersion = 1;
+  let appliedVersion = 0;
   const ownedModelIds = new Map<string, Set<string>>();
   const pendingRemovals = new Map<string, Set<string>>();
 
@@ -1194,9 +1590,34 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   // process, fire-and-forget at setup (no boot block) and awaited by the merge
   // command. Undefined until the fetch lands; the join contributes nothing
   // until then. Survives module re-eval via the globalThis cache slot.
+  //
+  // Startup replay race: on restart `mergedModelIds` is seeded from state and
+  // the rehydrated rows replay through the first transform BEFORE this fetch
+  // lands, so a replaying merged row keeps its registry-joined effort
+  // variants missing — the join is transform-time only and never persisted in
+  // state — until the next interval-gated cycle (300s default, up to cacheFor
+  // with a long success TTL). Re-fire the transform once the snapshot arrives,
+  // but only when there is something to join (non-empty snapshot) and the
+  // registration exists. A fetch landing before registration completes is
+  // covered by that initial refresh's own reload.
   let registrySnapshot: ReadonlyMap<string, ModelsDevProviderLite> | undefined;
   void loadModelsDevProviders().then((snapshot) => {
     registrySnapshot = snapshot;
+    stateVersion += 1;
+    if (
+      snapshot.size > 0 &&
+      mergedModelIds.size > 0 &&
+      catalogRegistration !== undefined &&
+      catalogSurface !== undefined
+    ) {
+      void (async () => {
+        try {
+          await catalogSurface.reload();
+        } catch {
+          safeFailure("catalog-reload", "runtime");
+        }
+      })();
+    }
   });
 
   // Toggle-only suppression (provider-docs verdict): a provider whose own
@@ -1223,6 +1644,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   const applyPollResults = (results: ReadonlyMap<string, ModelEntry[] | undefined>): void => {
     for (const [providerID, models] of results) {
       if (models === undefined) continue;
+      stateVersion += 1;
       // Successful polls (including successful empty ones) refresh the cache
       // TTL clock; failed polls leave the last success untouched so the next
       // interval retry stays eligible. Reconcile runs only here, on actual
@@ -1263,8 +1685,31 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     // live so a future runtime (or a restarted one) recovers with warm clocks.
     console.warn(`${LOG_PREFIX} no catalog surface (ctx.model/ctx.catalog); polling only.`);
   } else {
+    const bootCatT0 = Date.now();
     try {
       catalogRegistration = await catalogSurface.transform((draft) => {
+      if (!applying) return;
+      const applyT0 = Date.now();
+      // Fast path: the closure state is already applied and a per-provider
+      // probe says the draft still carries our rows -> the rebuild is a no-op
+      // for this plugin. A pending removal or a state change falls through to
+      // the full application below.
+      if (appliedVersion === stateVersion && pendingRemovals.size === 0) {
+        let intact = true;
+        for (const [providerID, models] of discovered) {
+          const probe = models[0];
+          if (probe === undefined) continue;
+          if (draft.model.get(providerID, probe.id) === undefined) {
+            intact = false;
+            break;
+          }
+        }
+        if (intact) {
+          console.log(`${LOG_PREFIX} transform skip v=${stateVersion} ms=${Date.now() - applyT0}`);
+          return;
+        }
+        console.log(`${LOG_PREFIX} transform probe-miss v=${stateVersion}`);
+      }
       for (const [providerID, models] of discovered) {
         const owned = ownedModelIds.get(providerID) ?? new Set<string>();
         for (const model of models) {
@@ -1301,6 +1746,23 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         }
       }
       pendingRemovals.clear();
+      appliedVersion = stateVersion;
+      const applyMs = Date.now() - applyT0;
+      // Post-apply probe: does the host's get() see what update() just wrote?
+      let retained = "n/a";
+      for (const [providerID, models] of discovered) {
+        const probe = models[0];
+        if (probe === undefined) continue;
+        try {
+          retained = String(draft.model.get(providerID, probe.id) !== undefined);
+        } catch {
+          retained = "throw";
+        }
+        break;
+      }
+      if (applyMs >= 30) {
+        console.log(`${LOG_PREFIX} transform apply ms=${applyMs} v=${appliedVersion} retained=${retained}`);
+      }
       });
     } catch (err) {
       // Degrade, don't abort: a moved host surface must never again silently
@@ -1313,6 +1775,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       );
       catalogRegistration = undefined;
     }
+    bootCatMs = Date.now() - bootCatT0;
   }
 
   let latestGeneration = 0;
@@ -1322,6 +1785,11 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   const lastSuccessMs = new Map<string, number>();
   const lastModelCounts = new Map<string, number>();
   const lastTriggers = new Map<string, StateTrigger>();
+  // Auth-failure pause (401/403): providerID -> epoch ms until it is due again.
+  // Cleared by a config-file edit, a force cycle, or a successful poll.
+  const authBlockedUntil = new Map<string, number>();
+  // Last sanitized failure per provider, persisted for post-hoc diagnosis.
+  const lastErrorByProvider = new Map<string, ProviderStateError>();
   // Stamped on force cycles (rescan command); seeded from the file so a
   // non-force rewrite never erases it.
   let lastRescanAtMs: number | undefined;
@@ -1340,6 +1808,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       if (Number.isFinite(polledMs)) lastPolledMs.set(providerID, polledMs);
       lastModelCounts.set(providerID, entry.modelCount);
       lastTriggers.set(providerID, entry.lastTrigger);
+      if (entry.lastError !== undefined) lastErrorByProvider.set(providerID, entry.lastError);
       if (entry.models !== undefined && entry.models.length > 0) {
         discovered.set(providerID, entry.models);
       }
@@ -1372,6 +1841,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       // requires the interval AND stale-or-unset TTL.
       // Merge is force-like: bypass interval + TTL + parameters cache, with
       // an optional provider filter (merge command targets one provider).
+      if (mode === "force") authBlockedUntil.clear();
       let due =
         mode === "force" || mode === "merge"
           ? providerFilter === undefined
@@ -1385,29 +1855,84 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               lastSuccessMs,
               globalCacheForSeconds,
               mode === "watch",
+              authBlockedUntil,
             );
       // Native merge targets (models.dev providers, no config entry) join the
       // due set directly; they are never part of `desired`.
       if (mode === "merge" && extraTargets !== undefined && extraTargets.length > 0) {
         due = [...due, ...extraTargets];
       }
-      // Mark attempt time BEFORE polling so failing providers never respin on
-      // the next tick; a successful commit is what actually refreshes catalog.
-      const attemptedAt = Date.now();
-      for (const target of due) lastPolledMs.set(target.id, attemptedAt);
+      // Provider ids that already hold models BEFORE this cycle, so an ack can
+      // say "kept last known" only where something was actually kept.
+      const withModels = [...discovered]
+        .filter(([, models]) => models.length > 0)
+        .map(([providerID]) => providerID);
       const storeAuthResolver = createStoreAuthResolver(ctx);
       await enrichTargetsWithStoreAuth(due, storeAuthResolver);
+      // requireAuth: skip providers with no resolvable credential instead of
+      // importing a catalog that cannot be called (a public /models listing
+      // does not mean the models are usable without a key).
+      const pollable: ProviderTarget[] = [];
+      const skipped: string[] = [];
+      for (const target of due) {
+        // The merge command is an explicit one-shot metadata fill, so it is
+        // never gated by requireAuth.
+        if (
+          mode !== "merge" &&
+          (target.requireAuth ?? globalRequireAuth) &&
+          !hasResolvedAuth(target)
+        ) {
+          skipped.push(target.id);
+          continue;
+        }
+        pollable.push(target);
+      }
+      // Mark attempt time BEFORE polling so failing (or credential-skipped)
+      // providers never respin on the next tick; a successful commit is what
+      // actually refreshes catalog. Skipped providers must be stamped too —
+      // otherwise they stay "due" every second and spin a no-op refresh.
+      const attemptedAt = Date.now();
+      for (const target of due) lastPolledMs.set(target.id, attemptedAt);
       // A merge cycle polls with enrichment forced on regardless of the
       // standing flag, so gap-fill has metadata to fill from.
       const pollTargets =
-        mode === "merge" ? due.map((target) => ({ ...target, enrich: true as const })) : due;
+        mode === "merge" ? pollable.map((target) => ({ ...target, enrich: true as const })) : pollable;
+      const cycleFailures = new Map<string, PollFailure>();
       const results = await pollAll(pollTargets, globalPollTimeoutMs, {
         cacheForSeconds: globalCacheForSeconds,
         intervalSeconds: globalIntervalSeconds,
         bypassParameterCache: mode === "force" || mode === "merge",
+        // The experiential catalog ignores its success TTL only for the
+        // force-mode rescan command; merge reuses the cached map.
+        bypassCatalogTtl: mode === "force",
+        onFailure: (providerID, failure) => {
+          cycleFailures.set(providerID, failure);
+        },
       });
       const mergeResults = mode === "merge" ? markMergeResults(results) : results;
       if (generation !== latestGeneration) return undefined;
+
+      // Failure bookkeeping: persist the sanitized marker for the state file
+      // (console output never reaches opencode.log) and pause a provider after
+      // a 401/403 so a bad key is not polled every interval forever. A success
+      // clears both.
+      const settledAt = Date.now();
+      for (const target of pollable) {
+        const failure = cycleFailures.get(target.id);
+        if (failure === undefined) {
+          authBlockedUntil.delete(target.id);
+          lastErrorByProvider.delete(target.id);
+          continue;
+        }
+        lastErrorByProvider.set(target.id, {
+          marker: failure.marker,
+          ...(failure.status !== undefined ? { status: failure.status } : {}),
+          at: new Date(settledAt).toISOString(),
+        });
+        if ((failure.status === 401 || failure.status === 403) && authBackoffMs > 0) {
+          authBlockedUntil.set(target.id, settledAt + authBackoffMs);
+        }
+      }
 
       const desiredIds = new Set(desired.map((target) => target.id));
       for (const target of targets) {
@@ -1417,6 +1942,8 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         ownedModelIds.delete(target.id);
         discovered.delete(target.id);
         mergedModelIds.delete(target.id);
+        lastErrorByProvider.delete(target.id);
+        authBlockedUntil.delete(target.id);
         console.log(
           `${LOG_PREFIX} Provider "${target.id}" removed from config; dropping ${owned.size} discovered model(s)`,
         );
@@ -1477,6 +2004,8 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
               // restart inside the TTL rehydrates from here instead of polling.
               models: discovered.get(target.id),
             };
+            const lastError = lastErrorByProvider.get(target.id);
+            if (lastError !== undefined) entry.lastError = lastError;
             // mergedModelIds rides every write (not only merge cycles) so a
             // normal cycle never erases the recorded ids.
             const mergedIds = mergedModelIds.get(target.id);
@@ -1491,7 +2020,11 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
           safeFailure("state-file-write", "runtime");
         }
       }
-      return buildRefreshSummary(due, results);
+      return buildRefreshSummary(due, results, {
+        failures: [...cycleFailures].map(([providerID, failure]) => ({ providerID, ...failure })),
+        withModels,
+        skipped,
+      });
     } catch {
       safeFailure("refresh", "runtime");
       return { outcome: "error", polled: 0, discoveredCounts: [], failed: [] };
@@ -1522,16 +2055,42 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
 
   /** Immediate refresh that still respects each target's cache TTL. */
   const watchRefresh = (): void => {
+    // A config edit may have fixed the credential a provider was paused for;
+    // drop every auth pause so the edited config takes effect immediately.
+    authBlockedUntil.clear();
     void scheduleRefresh("watch");
   };
 
   // Initial poll, then rebuild the catalog so the transform runs with data.
-  await scheduleRefresh();
+  // Blocking boot (background: false) awaits that first cycle here. Background
+  // boot (the default) must NOT: the host gates plugin activation on setup
+  // resolving, so an awaited cycle kept `/api/model` at 503 for the poll's
+  // whole network time. The deferred kickoff arms the transform body (kept
+  // quiet through the host's boot-time rebuilds) and runs the first cycle
+  // after the host has finished booting. Warm boots inside the cacheFor TTL
+  // rehydrate the catalog from the state file and skip the network entirely.
+  let bootTimer: ReturnType<typeof setTimeout> | undefined;
+  if (backgroundBoot) {
+    bootTimer = setTimeout(() => {
+      bootTimer = undefined;
+      applying = true;
+      void scheduleRefresh();
+    }, backgroundDeferMs);
+  } else {
+    await scheduleRefresh();
+  }
 
   // One ticker loop; each tick wakes only when some target's interval elapsed.
   // Periodic refreshes stay serialized; a newer generation invalidates any
   // slow poll before its results can mutate targets, ownership, or catalog.
   const tick = (): void => {
+    // Trigger file = scriptable force refresh (no slash-command dispatch in
+    // headless `opencode run`). Consumed once per appearance; a force cycle
+    // also clears auth pauses so a rotated key is retried immediately.
+    if (consumeTriggerFile(triggerPath)) {
+      void scheduleRefresh("force");
+      return;
+    }
     if (
       computeDueTargets(
         targets,
@@ -1540,6 +2099,8 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         globalIntervalSeconds,
         lastSuccessMs,
         globalCacheForSeconds,
+        false,
+        authBlockedUntil,
       ).length > 0
     ) {
       void scheduleRefresh();
@@ -1562,6 +2123,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   let commandRegistration: { dispose(): Promise<void> | void } | undefined;
   const commandApi = ctx.command;
   if (commandApi && typeof commandApi.transform === "function") {
+    const bootCmdT0 = Date.now();
     try {
       commandRegistration = await commandApi.transform((draft) => {
         draft.add({
@@ -1570,8 +2132,9 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
           execute: async (context): Promise<void> => {
             const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined;
             const sessionApi = ctx.session;
-            // Best-effort session ack: never fail the rescan over a missing
-            // session surface or a rejected synthetic post.
+            // Best-effort inbox-only session ack (resume:false posts no
+            // scheduled run): never fail the rescan over a missing session
+            // surface or a rejected synthetic post.
             const ack = (text: string): void => {
               if (sessionID === undefined) return;
               try {
@@ -1579,6 +2142,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
                   sessionID,
                   text: `${text} [${new Date().toISOString()}]`,
                   description: "models-discovery-rescan",
+                  resume: false,
                 });
                 if (posted && typeof posted.catch === "function") posted.catch(() => {});
               } catch {
@@ -1672,13 +2236,23 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
     } catch {
       // Silent fail: the rescan command is a convenience, not a requirement.
     }
+    bootCmdMs = Date.now() - bootCmdT0;
   }
+
+  // Boot diagnostics: which awaited phase holds plugin activation open.
+  console.log(
+    `${LOG_PREFIX} setup ms: catalog=${bootCatMs} command=${bootCmdMs} total=${Date.now() - bootT0}`,
+  );
 
   let cleanedUp = false;
   return async (): Promise<void> => {
     if (cleanedUp) return;
     cleanedUp = true;
     clearInterval(pollInterval);
+    if (bootTimer !== undefined) {
+      clearTimeout(bootTimer);
+      bootTimer = undefined;
+    }
     configWatch.dispose();
     if (immediateRefreshHook === forceRefresh) immediateRefreshHook = undefined;
     if (catalogRegistration !== undefined) {

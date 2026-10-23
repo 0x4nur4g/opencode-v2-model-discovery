@@ -84,11 +84,19 @@ interface PluginContextLite {
   command?: CommandTransformApiLite;
   /**
    * Session surface for user-visible command acknowledgements; absent in
-   * mocks and runtimes without it. `synthetic` posts a synthetic session
-   * message without triggering an agent run. `get` reads a session record.
+   * mocks and runtimes without it. `synthetic` durably admits a synthetic
+   * session message; the default (resume omitted or null) SCHEDULES an agent
+   * run and can wake an idle session, while `resume: false` opts out — the
+   * note stays inbox-only until the next natural drain. `get` reads a session
+   * record.
    */
   session?: {
-    synthetic(input: { sessionID: string; text: string; description?: string }): Promise<unknown>;
+    synthetic(input: {
+      sessionID: string;
+      text: string;
+      description?: string;
+      resume?: boolean | null;
+    }): Promise<unknown>;
     /**
      * Read a session record (sanctioned v2 surface). The session's active
      * model lives at info.model ({id, providerID, variant?}); absent when no

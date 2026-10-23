@@ -34,6 +34,12 @@ export interface ModelMetadata {
   capabilities?: ModelCapabilitiesLite;
   limit?: ModelLimitLite;
   variants?: ModelVariantLite[];
+  /**
+   * Explicit deny marker from a provider-specific route catalog: the model's
+   * default route declares no usable reasoning efforts, so guessed
+   * cross-provider (models.dev) variant joins must not be presented for it.
+   */
+  reasoningDenied?: true;
 }
 
 export interface ModelEntry {
@@ -227,12 +233,14 @@ function composeMetadata(
   capabilities: ModelCapabilitiesLite | undefined,
   limit: ModelLimitLite | undefined,
   variants: ModelVariantLite[] | undefined,
+  reasoningDenied?: true,
 ): ModelMetadata | undefined {
-  if (!capabilities && !limit && !variants) return undefined;
+  if (!capabilities && !limit && !variants && !reasoningDenied) return undefined;
   const metadata: ModelMetadata = {};
   if (capabilities) metadata.capabilities = capabilities;
   if (limit) metadata.limit = limit;
   if (variants) metadata.variants = variants;
+  if (reasoningDenied) metadata.reasoningDenied = true;
   return metadata;
 }
 
@@ -241,6 +249,7 @@ function normalizeMetadata(value: Record<string, unknown>): ModelMetadata | unde
     parseCapabilities(value.capabilities),
     parseLimit(value.limit),
     mergeVariants(parseVariants(value.variants), parseReasoningOptionVariants(value.reasoning_options)),
+    value.reasoningDenied === true ? true : undefined,
   );
 }
 
@@ -333,6 +342,7 @@ export function parseModelMetadata(value: unknown): ModelMetadata | undefined {
       parseSupportedEffortVariants(value.reasoning),
       parseAdditionalAttributesVariants(value.additional_attributes),
     ),
+    normalized?.reasoningDenied,
   );
 }
 
@@ -461,9 +471,15 @@ export function resolveModelMetadata(
   };
   const capabilities = pick(rich?.capabilities, joined?.capabilities);
   const limit = pick(rich?.limit, joined?.limit);
-  const variants = pick(rich?.variants, joined?.variants);
+  // Explicit deny: the provider says this model's default route has no usable
+  // efforts, so the join must not supply guessed variants (other fields still
+  // resolve rich > join as usual).
+  const variants = pick(
+    rich?.variants,
+    rich?.reasoningDenied === true ? undefined : joined?.variants,
+  );
 
-  const metadata = composeMetadata(capabilities, limit, variants);
+  const metadata = composeMetadata(capabilities, limit, variants, rich?.reasoningDenied);
   if (!metadata) return { provenance: "name-only" };
   const provenance: EnrichmentProvenance =
     richUsed && joinUsed ? "mixed" : richUsed ? "provider-rich" : "join";

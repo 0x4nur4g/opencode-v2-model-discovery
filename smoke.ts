@@ -51,6 +51,7 @@ async function main(): Promise<void> {
     "OPENCODE_DISABLE_PROJECT_CONFIG",
     "OPENCODE_MODELS_DISCOVERY_DEFAULT_ENABLED",
     "OPENCODE_MODELS_DISCOVERY_STATE_FILE",
+    "OPENCODE_MODELS_DISCOVERY_BACKGROUND",
     "XDG_CONFIG_HOME",
     "HOME",
   ] as const;
@@ -67,6 +68,10 @@ async function main(): Promise<void> {
   // in cleanup below.
   const smokeStatePath = path.join(configRoot, "model-discovery", "state.json");
   process.env.OPENCODE_MODELS_DISCOVERY_STATE_FILE = smokeStatePath;
+  // Blocking boot for the smoke assertions below (several require the initial
+  // poll to have completed when setup resolves). Background boot — the default
+  // the host relies on — is covered by background.test.ts.
+  process.env.OPENCODE_MODELS_DISCOVERY_BACKGROUND = "false";
 
   const { default: plugin, requestImmediateRefresh } = await import("opencode-v2-model-discovery");
 

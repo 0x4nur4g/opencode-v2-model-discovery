@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -105,6 +105,29 @@ function catalogRecord(
     models: new Map(Object.entries(models)),
   };
 }
+
+/**
+ * Every captured synthetic ack must be inbox-only: `resume: false` means the
+ * note schedules no session run (it promotes only at the next natural drain).
+ */
+function expectInboxOnlyAcks(
+  ...ackLists: ReadonlyArray<ReadonlyArray<{ resume?: boolean | null }>>
+): void {
+  for (const acks of ackLists) {
+    expect(acks.length).toBeGreaterThan(0);
+    expect(acks.every((ack) => ack.resume === false)).toBe(true);
+  }
+}
+
+// Blocking boot for this suite: its assertions assume the initial poll has
+// completed by the time `await setup()` resolves (fetch counts, state writes,
+// catalog reloads). Background boot — the default, what the host relies on to
+// keep plugin activation off the provider poll — is covered by
+// background.test.ts, which manages the env itself.
+const BACKGROUND_ENV = "OPENCODE_MODELS_DISCOVERY_BACKGROUND";
+beforeAll(() => {
+  process.env[BACKGROUND_ENV] = "0";
+});
 
 // Per-test state-file isolation: setup() writes the discovery state file at
 // `${XDG_STATE_HOME:-~/.local/state}/opencode/model-discovery/state.json`;
@@ -1461,7 +1484,7 @@ describe("rescan triggers", () => {
       fetchCount += 1;
       return new Response(JSON.stringify({ data: [{ id: "ack-m" }] }), { status: 200 });
     };
-    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }> = [];
     let registered:
       | { name: string; execute: (context?: { sessionID?: string }) => Promise<void> | void }
       | undefined;
@@ -1502,6 +1525,8 @@ describe("rescan triggers", () => {
 
       await registered!.execute({ sessionID: "ses_ack_test" });
       expect(acks.length).toBe(2);
+      // Both acks are inbox-only: no scheduled session run.
+      expectInboxOnlyAcks(acks);
       // Acks carry a trailing ISO timestamp; assert the text prefix and shape.
       expect(acks[0].sessionID).toBe("ses_ack_test");
       expect(acks[0].description).toBe("models-discovery-rescan");
@@ -2552,7 +2577,7 @@ describe("merge gap-fill and merge command", () => {
     registry: ReadonlyMap<string, { api?: string; models?: Record<string, unknown> }>,
   ): Promise<{
     row: Record<string, unknown>;
-    acks: Array<{ sessionID: string; text: string; description?: string }>;
+    acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }>;
     fetched: string[];
   }> {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergenative-case-"));
@@ -2573,7 +2598,7 @@ describe("merge gap-fill and merge command", () => {
       fetched.push(String(url));
       return new Response(JSON.stringify({ data: [{ id: "mimo" }] }), { status: 200 });
     };
-    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }> = [];
     const commandFake = captureCommands();
     const rows = new Map<string, Record<string, unknown>>([
       ["xiaomi:mimo", { name: "mimo", capabilities: {}, limit: {}, variants: [] }],
@@ -2900,7 +2925,7 @@ describe("merge gap-fill and merge command", () => {
       fetchCount += 1;
       return new Response(JSON.stringify({ data: [{ id: "mrg-m" }] }), { status: 200 });
     };
-    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }> = [];
     const commandFake = captureCommands();
     const context = {
       options: { providers: [{ id: "mrg", baseURL: "https://mrg.invalid/v1" }] },
@@ -2949,6 +2974,8 @@ describe("merge gap-fill and merge command", () => {
       expect(acks[4].text).toContain('unknown provider "ghost"');
       expect(acks[4].text).toContain("Config targets: mrg");
       expect(acks[4].text).toContain("Native providers: (none)");
+      // Every merge ack is inbox-only: no scheduled session run.
+      expectInboxOnlyAcks(acks);
 
       // Headless invocation (no sessionID) merges but posts no acks.
       const beforeHeadless = fetchCount;
@@ -2975,7 +3002,7 @@ describe("merge gap-fill and merge command", () => {
       fetched.push(String(url));
       return new Response(JSON.stringify({ data: [{ id: "mrg-m1" }] }), { status: 200 });
     };
-    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }> = [];
     const commandFake = captureCommands();
     const context = {
       options: {
@@ -3010,6 +3037,7 @@ describe("merge gap-fill and merge command", () => {
       expect(acks[0].description).toBe("models-discovery-merge");
       expect(acks[0].text).toContain('the active model m1 on provider "mrg"');
       expect(acks[1].text).toContain("merge complete");
+      expectInboxOnlyAcks(acks);
       // Only the active model's provider was re-polled; "other" was left alone.
       expect(fetched.filter((url) => url.includes("mrg.invalid")).length).toBe(mrgBefore + 1);
       expect(fetched.filter((url) => url.includes("other.invalid")).length).toBe(otherBefore);
@@ -3034,7 +3062,7 @@ describe("merge gap-fill and merge command", () => {
       fetched.push(String(url));
       return new Response(JSON.stringify({ data: [{ id: "mimo-1" }, { id: "mimo-2" }] }), { status: 200 });
     };
-    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }> = [];
     const commandFake = captureCommands();
     let registered: ((draft: any) => void) | undefined;
     const draft = {
@@ -3081,6 +3109,7 @@ describe("merge gap-fill and merge command", () => {
       await merge!.execute({ sessionID: "s1", prompt: { text: "" } });
       expect(acks[0].text).toContain('the active model mimo-v2.6-pro on native provider "xiaomi"');
       expect(acks[1].text).toContain("merge complete");
+      expectInboxOnlyAcks(acks);
       // The merge polled ONLY the synthesized native target, never the config provider.
       expect(fetched.filter((url) => url.includes("cfg.invalid")).length).toBe(1);
       expect(fetched.filter((url) => url.includes("xiaomi.invalid"))).toEqual([
@@ -3110,6 +3139,7 @@ describe("merge gap-fill and merge command", () => {
     ]);
     expect(result.acks[0].text).toContain('native provider "xiaomi"');
     expect(result.acks[1].text).toContain("merge complete");
+    expectInboxOnlyAcks(result.acks);
   });
 
   test("toggle-only own registry entry suppresses the join and acks the honest line", async () => {
@@ -3134,6 +3164,7 @@ describe("merge gap-fill and merge command", () => {
     expect(suppression[0].text).toStartWith(
       'Provider "xiaomi" exposes no effort levels (thinking toggle only); efforts on other providers are gateway-side mappings.',
     );
+    expectInboxOnlyAcks(result.acks);
   });
 
   test("registry join still applies when the own entry is missing or lacks the toggle", async () => {
@@ -3166,6 +3197,7 @@ describe("merge gap-fill and merge command", () => {
     );
     expect(ownEffort.row.variants).toEqual([{ id: "low", settings: { reasoningEffort: "low" } }]);
     expect(ownEffort.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(false);
+    expectInboxOnlyAcks(missingOwn.acks, ownEffort.acks);
   });
 
   test("isToggleOnlyReasoning classifies toggle-only, effort, missing, and mixed shapes", async () => {
@@ -3227,6 +3259,7 @@ describe("merge gap-fill and merge command", () => {
     );
     expect(mixedOther.row.variants).toEqual([]);
     expect(mixedOther.acks.some((ack) => ack.text.includes("thinking toggle only"))).toBe(true);
+    expectInboxOnlyAcks(emptyList.acks, mixedEffort.acks, mixedOther.acks);
   });
 
   test("empty argument falls back to merge-all when the active model is unset, unknown, headless, or registry-less", async () => {
@@ -3242,7 +3275,7 @@ describe("merge gap-fill and merge command", () => {
       fetchCount += 1;
       return new Response(JSON.stringify({ data: [{ id: "fb-m1" }] }), { status: 200 });
     };
-    const acks: Array<{ sessionID: string; text: string; description?: string }> = [];
+    const acks: Array<{ sessionID: string; text: string; description?: string; resume?: boolean | null }> = [];
     const commandFake = captureCommands();
     let sessionGetResult: unknown = {};
     let registered: ((draft: any) => void) | undefined;
@@ -3314,6 +3347,7 @@ describe("merge gap-fill and merge command", () => {
       await merge!.execute({ sessionID: "s1", prompt: { text: "" } });
       expect(acks.at(-2)!.text).toContain("all 2 config provider(s)");
       expect(acks.at(-1)!.text).toContain("merge complete");
+      expectInboxOnlyAcks(acks);
       await cleanup?.();
     } finally {
       setModelsDevRegistryForTests(new Map());
@@ -3514,6 +3548,195 @@ describe("merge gap-fill and merge command", () => {
       });
       await cleanup?.();
     } finally {
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("startup replay completes registry-joined variants when the registry lands after the first replay", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergelate-"));
+    const restore = isolateConfigEnv(dir);
+    const now = Date.now();
+    writeStateFile(
+      isolatedStatePath,
+      buildStateFile(
+        new Map([
+          [
+            "p1",
+            withMergedModelIds(
+              {
+                // Fresh success clock: the boot cycle polls nothing ...
+                lastSuccessMs: now - 10_000,
+                lastPolledMs: now - 10_000,
+                modelCount: 1,
+                cacheForSeconds: 86400,
+                lastTrigger: "poll",
+                // ... and the rehydrated payload carries no variants: the
+                // registry join is transform-time only, never persisted.
+                models: [{ id: "seed-b" }],
+              },
+              ["seed-b"],
+            ),
+          ],
+        ]),
+      ),
+    );
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    // Controllable models.dev fetch: hold the response until the test resolves
+    // it, reproducing the startup race. The /models count stays 0 (the fresh
+    // TTL clock skips every boot poll), proving the re-fire needs no polling
+    // wait.
+    let resolveRegistry: ((response: Response) => void) | undefined;
+    let modelsFetches = 0;
+    globalThis.fetch = async (url: unknown) => {
+      if (String(url).includes("models.dev")) {
+        return await new Promise<Response>((resolve) => {
+          resolveRegistry = resolve;
+        });
+      }
+      modelsFetches += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    };
+    // The per-test beforeEach pre-populated the process-global registry cache;
+    // clear it so the stub above is the only registry source.
+    setModelsDevRegistryForTests(undefined);
+    let reloads = 0;
+    const rows = new Map<string, Record<string, unknown>>([["p1:seed-b", { name: "seed-b" }]]);
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: (providerID: string, modelID: string, update: (model: any) => void) => {
+          const key = `${providerID}:${modelID}`;
+          const row = rows.get(key) ?? {};
+          update(row);
+          rows.set(key, row);
+        },
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }], cacheFor: 86400 },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          reloads += 1;
+          registered?.(draft);
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      expect(resolveRegistry).toBeDefined();
+      // First replay: the merged id re-applies gap-fill, but the registry has
+      // not landed yet, so the row still lacks the joined variants.
+      expect(rows.get("p1:seed-b")?.variants).toBeUndefined();
+      expect(modelsFetches).toBe(0);
+      const reloadsBeforeRegistry = reloads;
+      resolveRegistry!(
+        new Response(
+          JSON.stringify({
+            other: {
+              models: {
+                "seed-b": {
+                  reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+                },
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+      // Flush the fetch chain: response.json() -> snapshot -> transform re-fire.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // The re-fire completes the row without waiting for a polling cycle ...
+      expect(rows.get("p1:seed-b")?.variants).toEqual([
+        { id: "low", settings: { reasoningEffort: "low" } },
+        { id: "high", settings: { reasoningEffort: "high" } },
+      ]);
+      expect(reloads).toBe(reloadsBeforeRegistry + 1);
+      expect(modelsFetches).toBe(0);
+      await cleanup?.();
+    } finally {
+      setModelsDevRegistryForTests(new Map());
+      restore();
+      globalThis.fetch = previousFetch;
+      (globalThis as any).setInterval = previousSetInterval;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("registry landing skips the transform re-fire when no merged ids exist", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-sd-mergenoids-"));
+    const restore = isolateConfigEnv(dir);
+    const previousSetInterval = globalThis.setInterval;
+    (globalThis as any).setInterval = (): number => 1;
+    const previousFetch = globalThis.fetch;
+    let resolveRegistry: ((response: Response) => void) | undefined;
+    globalThis.fetch = async (url: unknown) => {
+      if (String(url).includes("models.dev")) {
+        return await new Promise<Response>((resolve) => {
+          resolveRegistry = resolve;
+        });
+      }
+      return new Response(JSON.stringify({ data: [{ id: "m1" }] }), { status: 200 });
+    };
+    setModelsDevRegistryForTests(undefined);
+    let reloads = 0;
+    let registered: ((draft: any) => void) | undefined;
+    const draft = {
+      provider: { list: () => [], get: () => undefined, update: () => {}, remove: () => {} },
+      model: {
+        get: () => undefined,
+        update: () => {},
+        remove: () => {},
+        default: { get: () => undefined, set: () => {} },
+      },
+    } as any;
+    const context = {
+      options: { providers: [{ id: "p1", baseURL: "https://p1.invalid/v1" }] },
+      catalog: {
+        transform: async (callback: (draft: any) => void) => {
+          registered = callback;
+          return { dispose: async () => {} };
+        },
+        reload: async () => {
+          reloads += 1;
+          registered?.(draft);
+        },
+      },
+    } as any;
+    try {
+      const cleanup = await setup(context);
+      // No state file: the boot cycle polls /models and reloads once, and no
+      // merged ids exist anywhere.
+      const bootReloads = reloads;
+      expect(bootReloads).toBeGreaterThan(0);
+      resolveRegistry!(
+        new Response(
+          JSON.stringify({
+            other: {
+              models: { m1: { reasoning_options: [{ type: "effort", values: ["low"] }] } },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // Non-empty registry + registration present, but nothing merged: no re-fire.
+      expect(reloads).toBe(bootReloads);
+      await cleanup?.();
+    } finally {
+      setModelsDevRegistryForTests(new Map());
       restore();
       globalThis.fetch = previousFetch;
       (globalThis as any).setInterval = previousSetInterval;
@@ -4179,5 +4402,227 @@ describe("catalog surface resolution (legacy catalog vs v2.0.4+ model split)", (
       (globalThis as any).setInterval = previousSetInterval;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+import { decideEffortShortcut, default as tuiPlugin } from "./tui.tsx";
+
+describe("tui effort shortcut", () => {
+  const MODEL = { providerID: "p1", modelID: "m1" };
+
+  test("variants present delegates to the native cycle", () => {
+    const decision = decideEffortShortcut({
+      variants: ["high"],
+      current: MODEL,
+      sessionID: "s1",
+      now: 1000,
+    });
+    expect(decision.action).toBe("delegate");
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("empty variants with an open session arms the hint", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      sessionID: "s1",
+      now: 1000,
+    });
+    expect(decision.action).toBe("hint");
+    expect(decision.pending).toEqual({ providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 });
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("first press without a session blocks and arms nothing", () => {
+    const decision = decideEffortShortcut({ variants: [], current: MODEL, now: 1000 });
+    expect(decision.action).toBe("block-no-session");
+    expect(decision.pending).toBeUndefined();
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("armed, unchanged, within 5s triggers the merge command", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      sessionID: "s1",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      now: 6000, // exactly at the window edge: the 5s cutoff is inclusive
+    });
+    expect(decision.action).toBe("trigger");
+    expect(decision.command).toEqual({ name: "models-discovery-merge", text: "p1" });
+  });
+
+  test("armed then session vanished blocks and clears the pending state", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      now: 2000,
+    });
+    expect(decision.action).toBe("block-no-session");
+    expect(decision.pending).toBeUndefined();
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("model change re-arms instead of triggering", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      current: { providerID: "p1", modelID: "m2" },
+      sessionID: "s1",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      now: 2000,
+    });
+    expect(decision.action).toBe("hint");
+    expect(decision.pending).toEqual({
+      providerID: "p1",
+      modelID: "m2",
+      sessionID: "s1",
+      at: 2000,
+    });
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("session change re-arms instead of triggering", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      sessionID: "s2",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      now: 2000,
+    });
+    expect(decision.action).toBe("hint");
+    expect(decision.pending).toEqual({
+      providerID: "p1",
+      modelID: "m1",
+      sessionID: "s2",
+      at: 2000,
+    });
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("expired arm (> 5s) re-arms instead of triggering", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      sessionID: "s1",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      now: 6001,
+    });
+    expect(decision.action).toBe("hint");
+    expect(decision.pending).toEqual({ providerID: "p1", modelID: "m1", sessionID: "s1", at: 6001 });
+    expect(decision.command).toBeUndefined();
+  });
+
+  test("active cooldown hints without triggering", () => {
+    const blocked = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      sessionID: "s1",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      cooldownUntil: 9000,
+      now: 2000,
+    });
+    expect(blocked.action).toBe("hint");
+    expect(blocked.command).toBeUndefined();
+    expect(blocked.pending?.at).toBe(2000);
+    // The cooldown edge is allowed again: now >= cooldownUntil triggers.
+    const allowed = decideEffortShortcut({
+      variants: [],
+      current: MODEL,
+      sessionID: "s1",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      cooldownUntil: 2000,
+      now: 2000,
+    });
+    expect(allowed.action).toBe("trigger");
+  });
+
+  test("missing current model fails soft to a hint", () => {
+    const decision = decideEffortShortcut({
+      variants: [],
+      sessionID: "s1",
+      pending: { providerID: "p1", modelID: "m1", sessionID: "s1", at: 1000 },
+      now: 2000,
+    });
+    expect(decision.action).toBe("hint");
+    expect(decision.pending).toBeUndefined();
+  });
+
+  /** Captures the layer a fake TUI context registers, then runs its command. */
+  function captureLayer(fakeCtx: Record<string, unknown>): any {
+    let captured: any;
+    const ctx = {
+      ...fakeCtx,
+      keymap: {
+        layer: (register: () => unknown) => {
+          captured = register();
+        },
+      },
+    };
+    tuiPlugin.setup(ctx);
+    return captured;
+  }
+
+  test("setup claims the ctrl+t layer from the slot render", () => {
+    const layer = captureLayer({
+      ui: { slot: (claim: { render: () => unknown }) => claim.render() },
+    });
+    expect(layer.mode).toBe("global");
+    expect(layer.priority).toBe(10);
+    expect(layer.commands[0].id).toBe("models-discovery.effort-shortcut");
+    expect(layer.commands[0].bind).toBe("ctrl+t");
+    expect(layer.bindings).toEqual(["models-discovery.effort-shortcut"]);
+  });
+
+  test("delegate uses the native cycle surface when present", async () => {
+    let cycleCalls = 0;
+    const layer = captureLayer({
+      ui: {
+        slot: (claim: { render: () => unknown }) => claim.render(),
+        model: {
+          variant: {
+            list: () => ["high"],
+            cycle: () => {
+              cycleCalls += 1;
+            },
+          },
+        },
+      },
+    });
+    const handled = await layer.commands[0].run();
+    expect(handled).toBe(true);
+    expect(cycleCalls).toBe(1);
+  });
+
+  test("delegate emulates the native cycle through list/current/set", async () => {
+    const sets: string[] = [];
+    const layer = captureLayer({
+      ui: {
+        slot: (claim: { render: () => unknown }) => claim.render(),
+        model: {
+          variant: {
+            list: () => ["low", "medium", "high"],
+            set: (variant: string) => {
+              sets.push(variant);
+            },
+          },
+          current: () => ({ providerID: "p1", modelID: "m1", variant: "low" }),
+        },
+      },
+    });
+    const handled = await layer.commands[0].run();
+    expect(handled).toBe(true);
+    expect(sets).toEqual(["medium"]);
+  });
+
+  test("delegate with no cycle/current/set surfaces falls back to return false", async () => {
+    const layer = captureLayer({
+      ui: {
+        slot: (claim: { render: () => unknown }) => claim.render(),
+        model: { variant: { list: () => ["high"] } },
+      },
+    });
+    const handled = await layer.commands[0].run();
+    expect(handled).toBe(false);
   });
 });

@@ -1,11 +1,14 @@
 /** Seconds machinery: parse/validate/resolution for poll interval, cache TTL, and poll timeout. */
 
 import {
+  DEFAULT_AUTH_BACKOFF_SECONDS,
   DEFAULT_POLL_INTERVAL_SECONDS,
+  MIN_AUTH_BACKOFF_SECONDS,
   MIN_CACHE_FOR_SECONDS,
   MIN_POLL_INTERVAL_SECONDS,
   MIN_POLL_TIMEOUT_SECONDS,
   POLL_TIMEOUT_MS,
+  authBackoffWarns,
   cacheForWarns,
   intervalWarns,
   pollTimeoutWarns,
@@ -113,6 +116,27 @@ export const POLL_TIMEOUT_SPEC = {
 } satisfies SecondsOptionSpec;
 
 /**
+ * Auth-failure pause knobs: `0` disables the pause; other below-min values
+ * clamp up to the floor. Non-numeric values fall through to the default.
+ */
+export function parseAuthBackoffSeconds(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  if (value === 0) return 0;
+  const whole = Math.trunc(value);
+  return whole < MIN_AUTH_BACKOFF_SECONDS ? MIN_AUTH_BACKOFF_SECONDS : whole;
+}
+
+export const AUTH_BACKOFF_SPEC = {
+  parse: parseAuthBackoffSeconds,
+  field: "authBackoffSeconds",
+  invalidSuffix: `(non-numeric); using default ${DEFAULT_AUTH_BACKOFF_SECONDS}s.`,
+  min: MIN_AUTH_BACKOFF_SECONDS,
+  envKey: "env:auth-backoff",
+  envSource: "OPENCODE_MODELS_DISCOVERY_AUTH_BACKOFF_SECONDS",
+  fallback: DEFAULT_AUTH_BACKOFF_SECONDS,
+} satisfies SecondsOptionSpec;
+
+/**
  * Resolve one seconds option with per-provider > options > env > fallback
  * precedence. Invalid values fall through to the next source and warn once
  * per source key; a parsed value differing from the raw one was clamped and
@@ -199,6 +223,21 @@ export function resolvePollTimeoutSeconds(
   return (
     resolveSecondsOption(perProvider, options, envValue, POLL_TIMEOUT_SPEC, pollTimeoutWarns) ??
     POLL_TIMEOUT_MS / 1000
+  );
+}
+
+/**
+ * Resolve the auth-failure pause (seconds) with options > env > default
+ * precedence. `0` disables the pause. Invalid values fall through to the next
+ * source and warn once per source key.
+ */
+export function resolveAuthBackoffSeconds(
+  options?: unknown,
+  envValue?: unknown,
+): number {
+  return (
+    resolveSecondsOption(undefined, options, envValue, AUTH_BACKOFF_SPEC, authBackoffWarns) ??
+    DEFAULT_AUTH_BACKOFF_SECONDS
   );
 }
 

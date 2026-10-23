@@ -21,6 +21,9 @@ export {
   resetWarnedIntervalKeys,
   resetWarnedPollTimeoutKeys,
   resetWarnedWatchPaths,
+  resolveBackgroundBoot,
+  resolveBackgroundDeferMs,
+  DEFAULT_BACKGROUND_DEFER_MS,
 } from "./core.ts";
 export {
   parseCacheForSeconds,

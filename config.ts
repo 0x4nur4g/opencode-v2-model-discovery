@@ -4,6 +4,7 @@
 import { resolve as pathResolve } from "node:path";
 
 import {
+  MAX_PAGINATION_PAGES,
   authEnvWarns,
   cacheForWarns,
   intervalWarns,
@@ -61,9 +62,63 @@ export interface ProviderTarget {
   readonly pollTimeoutMs?: number;
   /** Per-provider parameters endpoint path (e.g. "/api/models/parameters"); global applies otherwise. */
   readonly parametersPath?: string;
+  /** Poll only when a credential resolves; skips the provider otherwise. */
+  readonly requireAuth?: boolean;
+  /** Extra query parameters appended to every poll request. */
+  readonly query?: Record<string, string>;
+  /** Opt-in page walking for paginated catalogs. */
+  readonly pagination?: ProviderPagination;
 }
 
 export type ProviderConfigMap = Record<string, Record<string, unknown>>;
+
+/** Opt-in page walking for providers whose `/models` endpoint is paginated. */
+export interface ProviderPagination {
+  /** Query parameter holding the page number (1-based). */
+  readonly pageParam: string;
+  /** Query parameter holding the page size; omitted keeps the provider default. */
+  readonly perPageParam?: string;
+  /** Page size sent as `perPageParam`; also stops a walk on a short page. */
+  readonly perPage?: number;
+  /** Page cap for one poll; clamped to MAX_PAGINATION_PAGES. */
+  readonly maxPages?: number;
+}
+
+/** String-valued query parameters appended to every poll request. */
+function parseQueryRecord(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) return undefined;
+  const entries = Object.entries(value)
+    .filter(([, raw]) => typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean")
+    .map(([key, raw]) => [key, String(raw)] as const);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/** Tolerant parse of `modelsDiscovery.pagination`; absent/malformed reads as off. */
+function parsePagination(value: unknown): ProviderPagination | undefined {
+  if (!isRecord(value)) return undefined;
+  const pageParam =
+    typeof value.pageParam === "string" && value.pageParam.trim() !== ""
+      ? value.pageParam.trim()
+      : "page";
+  const perPageParam =
+    typeof value.perPageParam === "string" && value.perPageParam.trim() !== ""
+      ? value.perPageParam.trim()
+      : undefined;
+  const perPage =
+    typeof value.perPage === "number" && Number.isInteger(value.perPage) && value.perPage > 0
+      ? value.perPage
+      : undefined;
+  const maxPages =
+    typeof value.maxPages === "number" && Number.isInteger(value.maxPages) && value.maxPages > 0
+      ? Math.min(MAX_PAGINATION_PAGES, value.maxPages)
+      : undefined;
+  return {
+    pageParam,
+    ...(perPageParam !== undefined ? { perPageParam } : {}),
+    ...(perPage !== undefined ? { perPage } : {}),
+    ...(maxPages !== undefined ? { maxPages } : {}),
+  };
+}
 
 export interface ParseProvidersResult {
   readonly targets: ProviderTarget[];
@@ -242,6 +297,9 @@ export function parseProviders(
       typeof e.headers === "object" && e.headers !== null
         ? (e.headers as Record<string, string>)
         : undefined;
+    const requireAuth = typeof e.requireAuth === "boolean" ? e.requireAuth : undefined;
+    const query = parseQueryRecord(e.query);
+    const pagination = parsePagination(e.pagination);
     targets.push({
       id,
       baseURL: baseURL.replace(/\/+$/, ""),
@@ -251,6 +309,9 @@ export function parseProviders(
       filter,
       enabled,
       ...(parametersPath ? { parametersPath } : {}),
+      ...(requireAuth !== undefined ? { requireAuth } : {}),
+      ...(query !== undefined ? { query } : {}),
+      ...(pagination !== undefined ? { pagination } : {}),
     });
   }
   return { targets, disabledIds, warnings };
@@ -427,6 +488,15 @@ export function selectAutoTargets(
       if (seconds !== undefined) pollTimeoutMs = seconds * 1000;
     }
 
+    let requireAuth: boolean | undefined;
+    let query: Record<string, string> | undefined;
+    let pagination: ProviderPagination | undefined;
+    if (isRecord(flag)) {
+      if (typeof flag.requireAuth === "boolean") requireAuth = flag.requireAuth;
+      query = parseQueryRecord(flag.query);
+      pagination = parsePagination(flag.pagination);
+    }
+
     const matchesNpm =
       [p.npm, p.package].some(
         (value) => typeof value === "string" && value.toLowerCase().includes("openai-compatible"),
@@ -532,6 +602,9 @@ export function selectAutoTargets(
       ...(cacheForSeconds !== undefined ? { cacheForSeconds } : {}),
       ...(pollTimeoutMs !== undefined ? { pollTimeoutMs } : {}),
       ...(parametersPath ? { parametersPath } : {}),
+      ...(requireAuth !== undefined ? { requireAuth } : {}),
+      ...(query !== undefined ? { query } : {}),
+      ...(pagination !== undefined ? { pagination } : {}),
     });
   }
   return { targets, messages };

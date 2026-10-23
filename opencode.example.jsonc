@@ -62,6 +62,11 @@
   //   { "enabled": true|false } -> force/skip
   //   { "endpoint": "..." }     -> poll this URL instead of `${baseURL}/models`
   // Relative endpoint URLs resolve against baseURL.
+  // Other per-provider fields:
+  //   "requireAuth": true       -> skip the provider when no credential resolves
+  //   "query": { "fields": "id,name" }  -> query params on every poll
+  //   "pagination": { "pageParam": "page", "perPageParam": "per_page",
+  //                   "perPage": 1000, "maxPages": 10 }
   // Example:
   //   "options": {
   //     "baseURL": "https://my-gateway.example.com/<compatible-root>",
@@ -111,6 +116,11 @@
   //   ${XDG_STATE_HOME:-~/.local/state}/opencode/model-discovery/state.json
   //   (never credentials); OPENCODE_MODELS_DISCOVERY_STATE_FILE overrides the
   //   path. Restart seeding honors a running cacheFor TTL across restarts.
+  //   Boot is background by default (setup never waits on the first poll, and
+  //   the catalog application is deferred past the host's boot rebuilds);
+  //   option `background` / OPENCODE_MODELS_DISCOVERY_BACKGROUND=true/false,
+  //   1/0 flips the mode, `backgroundDeferMs` /
+  //   OPENCODE_MODELS_DISCOVERY_BACKGROUND_DEFER_MS sets the deferral.
   //   `/api/plugin` listed active path plugins in current-beta probes for both
   //   forms, but remains non-authoritative; use logs and catalog behavior.
   // ---------------------------------------------------------------------------
