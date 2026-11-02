@@ -2947,6 +2947,7 @@ describe("merge gap-fill and merge command", () => {
       expect([...commandFake.commands.keys()].sort()).toEqual([
         "models-discovery-merge",
         "models-discovery-rescan",
+        "models-discovery-status",
       ]);
       const merge = commandFake.commands.get("models-discovery-merge");
       expect(merge?.name).toBe("models-discovery-merge");

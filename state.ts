@@ -7,7 +7,7 @@
 // seeds clocks + models at startup and records successful cycles. Never
 // credentials.
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
 import { homedir } from "node:os";
 // @ts-ignore -- runtime builtin; local types keep compilation dependency-free.
@@ -17,9 +17,6 @@ import { parseModelMetadata } from "./metadata.ts";
 import type { ModelEntry } from "./metadata.ts";
 
 export const STATE_FILE_ENV = "OPENCODE_MODELS_DISCOVERY_STATE_FILE";
-
-/** Override for the rescan trigger file (see resolveTriggerFilePath). */
-export const TRIGGER_FILE_ENV = "OPENCODE_MODELS_DISCOVERY_TRIGGER_FILE";
 
 export const STATE_FILE_VERSION = 2;
 
@@ -79,35 +76,6 @@ export function resolveStateFilePath(env: Record<string, string | undefined> = p
   const stateRoot =
     xdgState !== undefined && xdgState.trim() !== "" ? xdgState.trim() : join(homedir(), ".local", "state");
   return join(stateRoot, "opencode", "model-discovery", "state.json");
-}
-
-/**
- * Rescan trigger file: the only scriptable refresh path (the host treats
- * `opencode run "/command"` as a prompt, so slash commands never dispatch
- * headless). The plugin checks it once per scheduler tick, deletes it, and
- * runs a force cycle. Defaults next to the state file.
- */
-export function resolveTriggerFilePath(
-  statePath: string,
-  env: Record<string, string | undefined> = process.env,
-): string {
-  const override = env[TRIGGER_FILE_ENV];
-  if (override !== undefined && override.trim() !== "") return resolve(override.trim());
-  return join(dirname(statePath), "refresh-request");
-}
-
-/**
- * Consume a pending trigger file: true when one was present and removed.
- * A read-only state directory degrades to "no trigger", never an error.
- */
-export function consumeTriggerFile(path: string): boolean {
-  try {
-    if (!existsSync(path)) return false;
-    rmSync(path, { force: true });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**

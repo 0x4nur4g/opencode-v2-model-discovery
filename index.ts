@@ -62,6 +62,7 @@ export {
   createConfigWatch,
   createStoreAuthResolver,
   formatRescanAck,
+  formatStatusAck,
   pollProvider,
   requestImmediateRefresh,
   resetWarnedParametersKeys,
@@ -92,5 +93,6 @@ export type {
   ConfigWatchHandle,
   RefreshSummary,
   ResolvedStoreCredential,
+  StatusProviderRow,
   StoreAuthResolver,
 } from "./runtime.ts";

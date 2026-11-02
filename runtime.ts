@@ -65,11 +65,9 @@ import {
 } from "./metadata.ts";
 import {
   buildStateFile,
-  consumeTriggerFile,
   loadStateFile,
   mergedModelIdsFor,
   resolveStateFilePath,
-  resolveTriggerFilePath,
   withMergedModelIds,
   writeStateFile,
   type ProviderStateError,
@@ -1192,6 +1190,40 @@ export function formatMergeAck(summary: RefreshSummary): string {
   return parts.join(" ");
 }
 
+/** One provider row for the status ack; sanitized (ids, counts, clocks only). */
+export interface StatusProviderRow {
+  readonly id: string;
+  readonly modelCount: number;
+  readonly lastSuccessMs?: number;
+  readonly lastPolledMs?: number;
+  readonly lastError?: ProviderStateError;
+}
+
+function statusClock(ms: number | undefined): string {
+  return ms !== undefined && ms > 0 ? new Date(ms).toISOString() : "never";
+}
+
+/** Format a status ack message; carries no URLs, bodies, or credentials. */
+export function formatStatusAck(
+  rows: readonly StatusProviderRow[],
+  lastRescanAtMs?: number,
+): string {
+  if (rows.length === 0) return "Models-discovery status: no discovery targets configured.";
+  const parts = rows.map((row) => {
+    const error =
+      row.lastError !== undefined
+        ? ` last-error=${row.lastError.marker}${row.lastError.status !== undefined ? ` status=${row.lastError.status}` : ""}`
+        : "";
+    return (
+      `${row.id} models=${row.modelCount} last-success=${statusClock(row.lastSuccessMs)} ` +
+      `last-poll=${statusClock(row.lastPolledMs)}${error}`
+    );
+  });
+  const rescan =
+    lastRescanAtMs !== undefined ? ` Last rescan: ${statusClock(lastRescanAtMs)}.` : "";
+  return `Models-discovery status: ${parts.join("; ")}.${rescan}`;
+}
+
 /**
  * Poll the due subset of the desired targets; target-less cycles refresh
  * nothing. A target is due when its interval has elapsed AND, when a cache
@@ -1544,9 +1576,6 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   // source of truth.
   const statePath = resolveStateFilePath();
   const persistedState = loadStateFile(statePath);
-  // Scriptable refresh: the host never dispatches `opencode run "/command"`,
-  // so a trigger file next to the state file is the CLI path (see bin/).
-  const triggerPath = resolveTriggerFilePath(statePath);
 
   let discovered = new Map<string, ModelEntry[]>();
   // Transform fast-path bookkeeping: the host re-runs the catalog transform on
@@ -2095,13 +2124,6 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
   // Periodic refreshes stay serialized; a newer generation invalidates any
   // slow poll before its results can mutate targets, ownership, or catalog.
   const tick = (): void => {
-    // Trigger file = scriptable force refresh (no slash-command dispatch in
-    // headless `opencode run`). Consumed once per appearance; a force cycle
-    // also clears auth pauses so a rotated key is retried immediately.
-    if (consumeTriggerFile(triggerPath)) {
-      void scheduleRefresh("force");
-      return;
-    }
     if (
       computeDueTargets(
         targets,
@@ -2241,6 +2263,26 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
             registrySnapshot = await loadModelsDevProviders();
             await runMerge(`provider "${arg}"`, new Set([arg]));
             return;
+          },
+        });
+        draft.add({
+          name: "models-discovery-status",
+          description: "Show discovered model counts and last poll status",
+          execute: async (context): Promise<void> => {
+            const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined;
+            const rows: StatusProviderRow[] = targets.map((target) => ({
+              id: target.id,
+              modelCount: lastModelCounts.get(target.id) ?? discovered.get(target.id)?.length ?? 0,
+              lastSuccessMs: lastSuccessMs.get(target.id),
+              lastPolledMs: lastPolledMs.get(target.id),
+              lastError: lastErrorByProvider.get(target.id),
+            }));
+            postSyntheticAck(
+              ctx.session,
+              sessionID,
+              "models-discovery-status",
+              formatStatusAck(rows, lastRescanAtMs),
+            );
           },
         });
       });

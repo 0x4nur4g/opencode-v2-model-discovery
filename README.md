@@ -88,7 +88,6 @@ Every option resolves through the same chain, highest first: per-provider → pl
 | `OPENCODE_MODELS_DISCOVERY_POLL_TIMEOUT_SECONDS` | env | — | Overrides `pollTimeoutSeconds`. |
 | `OPENCODE_MODELS_DISCOVERY_REQUIRE_AUTH` | env | — | Overrides `requireAuth` (`true`/`false`, also `1`/`0`). |
 | `OPENCODE_MODELS_DISCOVERY_AUTH_BACKOFF_SECONDS` | env | — | Overrides `authBackoffSeconds`. |
-| `OPENCODE_MODELS_DISCOVERY_TRIGGER_FILE` | env | — | Override the rescan trigger file path (see CLI below). |
 | `OPENCODE_MODELS_DISCOVERY_PARAMETERS_PATH` | env | — | Overrides `parametersPath`. |
 | `OPENCODE_MODELS_DISCOVERY_DEFAULT_ENABLED` | env | — | Default on/off when a provider has no explicit `modelsDiscovery` flag. |
 | `OPENCODE_MODELS_DISCOVERY_STATE_FILE` | env | — | Override the state file path (see below). |
@@ -123,18 +122,15 @@ An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) 
 - Refreshes are serialized with a generation guard: a slow poll can't commit stale results over a newer one.
 - Boot is background by default: `setup` resolves without waiting for the first poll, and the transform body stays quiet through the host's boot-time catalog rebuilds (each application of a rehydrated payload costs the host seconds of per-model draft writes). The deferred kickoff (`backgroundDeferMs`, default 3000 ms) arms the body and runs the first cycle right after boot, so discovered models appear moments later instead of gating readiness. Set `background: false` (or `OPENCODE_MODELS_DISCOVERY_BACKGROUND=false`) to await the first cycle inside `setup` with eager application instead.
 
-## Command line
+## Commands
 
-Slash commands do not dispatch from a headless shell (`opencode run "/models-discovery-rescan"` starts a normal agent turn). For scripts, use the bundled CLI:
+All operator actions run inside opencode. There is no CLI.
 
-```bash
-bun link                     # once, in this directory
-models-discovery status      # persisted clocks/counts + last sanitized error per provider
-models-discovery rescan      # request an immediate force refresh and wait for it
-models-discovery path        # state and trigger file paths
-```
+- `/models-discovery-rescan` — force a refresh now (bypasses interval, TTL, parameter cache, and auth pauses).
+- `/models-discovery-merge [provider]` — fill missing model metadata (see below).
+- `/models-discovery-status` — show per-provider model counts, last success/poll clocks, and the last sanitized error.
 
-`rescan` writes the trigger file (default `refresh-request` next to the state file, override with `OPENCODE_MODELS_DISCOVERY_TRIGGER_FILE`); the plugin checks it once per scheduler tick, deletes it, and runs a force cycle that bypasses interval, TTL, parameter cache, and auth pauses. Exit codes: `0` ok, `1` no cycle observed (service not running with this state path), `2` at least one provider failed.
+Each posts an inbox-only session acknowledgement; invocations without a session stay silent.
 
 ## State file
 

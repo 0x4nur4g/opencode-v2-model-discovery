@@ -4,9 +4,6 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "bin": {
-    "models-discovery": "./bin/models-discovery.ts"
-  },
   "exports": {
     ".": {
       "types": "./index.ts",
