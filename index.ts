@@ -46,6 +46,8 @@ export {
   discoveredModelName,
   entryMatches,
   extractEntries,
+  gatewayDisplayName,
+  gatewayUpstreamProvider,
   isBuiltinProviderRecord,
   mergeTargets,
   parseModelMetadata,

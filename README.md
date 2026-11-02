@@ -66,6 +66,7 @@ Every option resolves through the same chain, highest first: per-provider → pl
 | `modelsDiscovery.pollTimeoutSeconds` | provider | `20` | Stall window: abort after this long with **no bytes** (headers or body). Hard ceiling is 10x this value for the whole exchange; min `5`. |
 | `modelsDiscovery.parametersPath` | provider | off | Per-model parameters endpoint for providers whose `/models` lacks effort data (e.g. `/api/models/parameters`). |
 | `modelsDiscovery.requireAuth` | provider | plugin/env | Poll only when a credential resolves; otherwise skip the provider for that cycle. |
+| `modelsDiscovery.apiKeyHeader` | provider | `Authorization` | Header carrying the key for this provider's polls. Set to `x-bf-vk` for Bifrost virtual keys (raw key, no `Bearer` prefix). Overrides provider-level `apiKeyHeader`. |
 | `modelsDiscovery.query` | provider | off | Query parameters added to every poll request, e.g. `{ "fields": "id,name" }`. |
 | `modelsDiscovery.pagination` | provider | off | Page walking: `{ pageParam, perPageParam, perPage, maxPages }` (defaults `page`, off, off, `10`; max `100`). Stops on a short/empty/repeated page. |
 | `intervalSeconds` | plugin / env | `300` | Poll interval for every target; min `15`. |
@@ -76,10 +77,11 @@ Every option resolves through the same chain, highest first: per-provider → pl
 | `authBackoffSeconds` | plugin / env | `1800` | Pause after a 401/403 before that provider is polled again; `0` disables; min `60`. |
 | `background` | plugin / env | `true` | Boot mode: `true` runs the first poll after `setup` resolves (off the host's plugin-activation path); `false` awaits the first poll inside `setup`. |
 | `backgroundDeferMs` | plugin / env | `3000` | Background boot only: delay before the transform body arms and the first cycle runs; clamped `0`..`60000`. |
-| `providers` | plugin | — | Manual targets: `{ id, baseURL, apiKeyEnv, headers, filter, integrationID, enabled, requireAuth, query, pagination }`. `enabled: false` blocks a provider id entirely. |
+| `providers` | plugin | — | Manual targets: `{ id, baseURL, apiKeyEnv, apiKeyHeader, headers, filter, integrationID, enabled, requireAuth, query, pagination }`. `enabled: false` blocks a provider id entirely. |
 | `filter` | provider / manual target | — | Only inject model ids containing this substring. |
-| `apiKey` | provider | — | Literal or `{env:VAR}` interpolation; sent as `Authorization: Bearer …`. |
+| `apiKey` | provider | — | Literal or `{env:VAR}` interpolation; sent as `Authorization: Bearer …` unless `apiKeyHeader` overrides it. |
 | `apiKeyEnv` | provider / manual target | — | Environment variable holding the key. |
+| `apiKeyHeader` | provider / manual target | `Authorization` | Header carrying the key. Set to `x-bf-vk` for Bifrost virtual keys (raw key, no `Bearer` prefix). Required for legacy keys and when admin auth occupies `Authorization`. |
 | `headers` | provider / manual target | — | Extra headers on every request. |
 | `OPENCODE_MODELS_DISCOVERY_INTERVAL_SECONDS` | env | — | Overrides `intervalSeconds`. |
 | `OPENCODE_MODELS_DISCOVERY_CACHE_FOR_SECONDS` | env | — | Overrides `cacheFor`. |
@@ -113,7 +115,7 @@ An optional `parametersPath` endpoint (e.g. Bifrost's `/api/models/parameters`) 
 - A provider that answers 401/403 is paused for `authBackoffSeconds` (default 30 min, `0` disables) instead of being retried every interval; a config edit or a rescan retries it immediately.
 - The fetch timeout is a **stall** window: the abort fires only after that long with no bytes, so a large catalog that is still streaming is never cut off mid-body. An abort reports `poll-timeout`, never `response-parse`; the parse marker now means malformed JSON only.
 - A successful empty poll removes previously discovered models; models you registered yourself are never touched.
-- Your own model names are preserved — the plugin only names a model when none exists.
+- Your own model names are preserved — the plugin only names a model when none exists. Gateway ids (`provider/model`, e.g. Bifrost `openai/gpt-4o`) display as `[provider] name` (e.g. `[openai] GPT-4o`) so the upstream is visible under the single outer provider; an old unprefixed catalog name upgrades once, custom names stay untouched. Flat ids and id-equal names are unchanged.
 - The `models-discovery-rescan` command posts session acknowledgements: a "started" message immediately, then a sanitized summary (`N model(s) across M provider(s)`, plus any providers that failed and kept their last known models) when the cycle completes. The acknowledgements are inbox-only notes — they schedule no agent run and only surface with the next natural session drain. Invocations without a session stay silent.
 - The `models-discovery-merge` command (`/models-discovery-merge <provider>`) fills ONLY missing metadata fields — it never overwrites an existing `capabilities`/`limit`/`variants` value. It accepts a config discovery target id or a native (models.dev) provider id; with no argument it merges all config targets (native providers need an explicit id). Acks are inbox-only session notes (no scheduled agent run) and headless invocations stay silent, same as rescan.
 - `cacheFor` gates on the last **successful** poll; caching never delays recovery. The `models-discovery-rescan` command bypasses interval and TTL.

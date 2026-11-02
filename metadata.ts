@@ -346,6 +346,35 @@ export function parseModelMetadata(value: unknown): ModelMetadata | undefined {
   );
 }
 
+/** Extract the upstream provider from a gateway-style model id (`provider/model`).
+ * Returns the segment before the first `/`, or undefined for flat ids.
+ * Bifrost, OpenRouter, Featherless and similar gateways all use this shape:
+ * the outer OpenCode provider (e.g. `bifrost`) stays fixed while the model id
+ * carries the real upstream (`openai/gpt-4o`, `deepseek/deepseek-v4-flash`). */
+export function gatewayUpstreamProvider(modelID: string): string | undefined {
+  const slash = modelID.indexOf("/");
+  if (slash <= 0) return undefined;
+  const upstream = modelID.slice(0, slash).trim();
+  return upstream.length > 0 ? upstream : undefined;
+}
+
+/**
+ * Gateway-aware display name: prefix a human name with its upstream provider
+ * (`[openai] GPT-OSS 120B`) so a picker grouping every model under one outer
+ * provider (`bifrost`) still shows which upstream serves it. Idempotent:
+ * an already-prefixed name returns unchanged, and a raw id (no human name)
+ * stays as the id itself — the slash already shows the upstream.
+ */
+export function gatewayDisplayName(modelID: string, rawName: string): string {
+  const upstream = gatewayUpstreamProvider(modelID);
+  if (!upstream) return rawName;
+  if (rawName === modelID) return rawName;
+  const prefix = `[${upstream}] `;
+  if (rawName.startsWith(prefix)) return rawName;
+  if (rawName.toLowerCase().startsWith(prefix.toLowerCase())) return rawName;
+  return `${prefix}${rawName}`;
+}
+
 /** Extract model entries from a /models response body. Undefined = unrecognized shape. */
 export function extractEntries(body: unknown, enrich = false): ModelEntry[] | undefined {
   if (typeof body !== "object" || body === null) return undefined;
@@ -363,9 +392,15 @@ export function extractEntries(body: unknown, enrich = false): ModelEntry[] | un
     const id = item.id;
     if (typeof id !== "string" || id.length === 0) continue;
     const metadata = enrich ? parseModelMetadata(item) : undefined;
+    const rawName =
+      typeof item.name === "string" && item.name.length > 0
+        ? item.name
+        : typeof item.normalized_name === "string" && item.normalized_name.length > 0
+          ? item.normalized_name
+          : undefined;
     entries.push({
       id,
-      name: typeof item.name === "string" && item.name.length > 0 ? item.name : undefined,
+      name: rawName === undefined ? undefined : gatewayDisplayName(id, rawName),
       ...(metadata ? { metadata } : {}),
     });
   }
@@ -531,16 +566,28 @@ export function entryMatches(entry: ModelEntry, filter: string | undefined): boo
   return !filter || entry.id.includes(filter);
 }
 
-/** Preserve a non-empty catalog name unless it is already the model id. */
+/** Preserve a non-empty catalog name unless it is already the model id.
+ * Gateway-aware: a human name for a `provider/model` id is shown as
+ * `[provider] name`. An old unprefixed catalog name upgrades to the prefixed
+ * form; a genuinely custom name is still preserved. */
 export function discoveredModelName(
   existingName: unknown,
   modelID: string,
   discoveredName: string | undefined,
 ): string {
+  const want =
+    discoveredName === undefined ? modelID : gatewayDisplayName(modelID, discoveredName);
   if (typeof existingName === "string" && existingName.length > 0 && existingName !== modelID) {
+    if (existingName === want) return existingName;
+    const upstream = gatewayUpstreamProvider(modelID);
+    if (upstream) {
+      const prefix = `[${upstream}] `;
+      if (want === `${prefix}${existingName}`) return want;
+      if (want.toLowerCase() === `${prefix}${existingName}`.toLowerCase()) return want;
+    }
     return existingName;
   }
-  return discoveredName ?? modelID;
+  return want;
 }
 
 /** Merge manual and auto targets. Manual targets win when ids collide. */

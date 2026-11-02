@@ -42,6 +42,10 @@ export interface ProviderTarget {
   readonly id: string;
   readonly baseURL: string;
   readonly apiKeyEnv?: string;
+  /** Header carrying the key. Default `Authorization: Bearer <key>`.
+   * Set to `x-bf-vk` for Bifrost virtual keys (raw key, no prefix),
+   * required for legacy keys and when admin auth occupies `Authorization`. */
+  readonly apiKeyHeader?: string;
   readonly headers?: Record<string, string>;
   readonly filter?: string;
   readonly apiKey?: string;
@@ -287,6 +291,10 @@ export function parseProviders(
       continue;
     }
     const apiKeyEnv = typeof e.apiKeyEnv === "string" ? e.apiKeyEnv : undefined;
+    const apiKeyHeader =
+      typeof e.apiKeyHeader === "string" && e.apiKeyHeader.trim().length > 0
+        ? e.apiKeyHeader.trim()
+        : undefined;
     const integrationID = typeof e.integrationID === "string" ? e.integrationID : undefined;
     const filter = typeof e.filter === "string" ? e.filter : undefined;
     const parametersPath =
@@ -304,6 +312,7 @@ export function parseProviders(
       id,
       baseURL: baseURL.replace(/\/+$/, ""),
       apiKeyEnv,
+      ...(apiKeyHeader !== undefined ? { apiKeyHeader } : {}),
       integrationID,
       headers,
       filter,
@@ -409,7 +418,7 @@ function providerOptions(provider: Record<string, unknown>): Record<string, unkn
   if (isRecord(provider.headers)) {
     merged.headers = mergeConfigValues(merged.headers, provider.headers);
   }
-  for (const key of ["baseURL", "apiKey", "apiKeyEnv", "filter", "modelsDiscovery"]) {
+  for (const key of ["baseURL", "apiKey", "apiKeyEnv", "apiKeyHeader", "filter", "modelsDiscovery"]) {
     if (!(key in merged) && key in provider) merged[key] = provider[key];
   }
   return merged;
@@ -581,6 +590,15 @@ export function selectAutoTargets(
     if (apiKeyEnv && !environment[apiKeyEnv]) {
       warnUnsetAuthEnv(messages, id, "apiKeyEnv", apiKeyEnv);
     }
+    const flagApiKeyHeader =
+      isRecord(flag) && typeof flag.apiKeyHeader === "string" && flag.apiKeyHeader.trim().length > 0
+        ? flag.apiKeyHeader.trim()
+        : undefined;
+    const optsApiKeyHeader =
+      typeof opts.apiKeyHeader === "string" && opts.apiKeyHeader.trim().length > 0
+        ? opts.apiKeyHeader.trim()
+        : undefined;
+    const apiKeyHeader = flagApiKeyHeader ?? optsApiKeyHeader;
     const filter = typeof opts.filter === "string" ? opts.filter : undefined;
     const integrationID =
       typeof p.integrationID === "string"
@@ -593,6 +611,7 @@ export function selectAutoTargets(
       baseURL: normalizedBaseURL,
       apiKey,
       apiKeyEnv,
+      ...(apiKeyHeader !== undefined ? { apiKeyHeader } : {}),
       headers,
       filter,
       pollURL,

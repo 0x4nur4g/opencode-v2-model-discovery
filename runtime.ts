@@ -596,9 +596,20 @@ export async function pollProvider(
   const buildAuthHeaders = (): Record<string, string> => {
     const envKey = target.apiKeyEnv ? process.env[target.apiKeyEnv] : undefined;
     const apiKey = envKey ?? target.apiKey ?? target.storeAuth;
-    return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+    if (!apiKey) return {};
+    const header = target.apiKeyHeader?.trim();
+    if (header && header.length > 0 && header.toLowerCase() !== "authorization") {
+      return { [header]: apiKey };
+    }
+    return { Authorization: `Bearer ${apiKey}` };
   };
-  const headers: Record<string, string> = { ...(target.headers ?? {}), ...buildAuthHeaders() };
+  const authHeaders = buildAuthHeaders();
+  const authNames = new Set(Object.keys(authHeaders).map((name) => name.toLowerCase()));
+  const baseHeaders: Record<string, string> = {};
+  for (const [name, value] of Object.entries(target.headers ?? {})) {
+    if (!authNames.has(name.toLowerCase())) baseHeaders[name] = value;
+  }
+  const headers: Record<string, string> = { ...baseHeaders, ...authHeaders };
   const timeoutMs = target.pollTimeoutMs ?? fallbackTimeoutMs ?? POLL_TIMEOUT_MS;
   const report = (marker: string, status?: number): void => {
     parameters?.onFailure?.(
