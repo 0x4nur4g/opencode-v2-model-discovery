@@ -1212,7 +1212,9 @@ export function formatStatusAck(
   const parts = rows.map((row) => {
     const error =
       row.lastError !== undefined
-        ? ` last-error=${row.lastError.marker}${row.lastError.status !== undefined ? ` status=${row.lastError.status}` : ""}`
+        ? row.lastError.marker === "status" && row.lastError.status !== undefined
+          ? ` last-error=status=${row.lastError.status}`
+          : ` last-error=${row.lastError.marker}${row.lastError.status !== undefined ? ` status=${row.lastError.status}` : ""}`
         : "";
     return (
       `${row.id} models=${row.modelCount} last-success=${statusClock(row.lastSuccessMs)} ` +
