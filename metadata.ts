@@ -458,19 +458,57 @@ export function buildCatalogJoin(
   return candidates;
 }
 
+/** All other-provider candidates matching this model id: exact matches win,
+ * suffix matches (`vendor/model` vs `model`) are the fallback pool. */
+function matchingCandidates(
+  providerID: string,
+  modelID: string,
+  candidates: readonly CatalogJoinCandidate[],
+): CatalogJoinCandidate[] {
+  const otherProviders = candidates.filter((candidate) => candidate.providerID !== providerID);
+  const exact = otherProviders.filter((candidate) => candidateModelIDs(candidate).includes(modelID));
+  if (exact.length > 0) return exact;
+  return otherProviders.filter((candidate) =>
+    candidateModelIDs(candidate).some((candidateID) => isModelIDSuffix(modelID, candidateID)),
+  );
+}
+
 function chooseCatalogCandidate(
   providerID: string,
   modelID: string,
   candidates: readonly CatalogJoinCandidate[],
   isBuiltin: (candidate: CatalogJoinCandidate) => boolean,
 ): CatalogJoinCandidate | undefined {
-  const otherProviders = candidates.filter((candidate) => candidate.providerID !== providerID);
-  const exact = otherProviders.filter((candidate) => candidateModelIDs(candidate).includes(modelID));
-  if (exact.length > 0) return chooseJoinCandidate(exact, isBuiltin);
-  const suffix = otherProviders.filter((candidate) =>
-    candidateModelIDs(candidate).some((candidateID) => isModelIDSuffix(modelID, candidateID)),
-  );
-  return chooseJoinCandidate(suffix, isBuiltin);
+  return chooseJoinCandidate(matchingCandidates(providerID, modelID, candidates), isBuiltin);
+}
+
+/**
+ * Agreed-efforts join for the ambiguous case: when several providers define
+ * the same model id with different effort lists, no single list can be
+ * picked honestly — but the efforts EVERY definer agrees on are the weakest
+ * claim that fits all evidence. Returns those variants, in the first
+ * definer's order. Fewer than two variant-bearing definers, or an empty
+ * intersection, yields nothing.
+ */
+function intersectJoinVariants(
+  pool: readonly CatalogJoinCandidate[],
+): ModelVariantLite[] | undefined {
+  const lists: ModelVariantLite[][] = [];
+  for (const candidate of pool) {
+    const variants = normalizeMetadata(candidate.model as unknown as Record<string, unknown>)?.variants;
+    if (variants !== undefined && variants.length > 0) lists.push(variants);
+  }
+  if (lists.length < 2) return undefined;
+  let common = (lists[0] ?? []).map((variant) => variant.id);
+  for (const list of lists.slice(1)) {
+    const ids = new Set(list.map((variant) => variant.id));
+    common = common.filter((id) => ids.has(id));
+  }
+  if (common.length === 0) return undefined;
+  const first = lists[0] ?? [];
+  return common
+    .map((id) => first.find((variant) => variant.id === id))
+    .filter((variant): variant is ModelVariantLite => variant !== undefined);
 }
 
 /** Resolve rich metadata per FIELD: the provider response wins a field it
@@ -508,10 +546,16 @@ export function resolveModelMetadata(
   const limit = pick(rich?.limit, joined?.limit);
   // Explicit deny: the provider says this model's default route has no usable
   // efforts, so the join must not supply guessed variants (other fields still
-  // resolve rich > join as usual).
+  // resolve rich > join as usual). When no single candidate can be chosen
+  // (several definers disagree), the agreed-efforts intersection still joins.
+  const joinedVariants =
+    joined?.variants ??
+    (rich?.reasoningDenied === true
+      ? undefined
+      : intersectJoinVariants(matchingCandidates(providerID, modelID, candidates)));
   const variants = pick(
     rich?.variants,
-    rich?.reasoningDenied === true ? undefined : joined?.variants,
+    rich?.reasoningDenied === true ? undefined : joinedVariants,
   );
 
   const metadata = composeMetadata(capabilities, limit, variants, rich?.reasoningDenied);

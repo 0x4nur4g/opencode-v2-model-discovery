@@ -1456,10 +1456,17 @@ export function applyDiscovered(
     const merged = merge?.mergedModelIds?.get(providerID);
     for (const modelEntry of models) {
       try {
-        const resolution =
-          modelEntry.enrich === true
-            ? resolveModelMetadata(providerID, modelEntry.id, modelEntry.metadata, joinCandidates)
-            : { provenance: "name-only" as const };
+        // Join resolution runs for every discovered model so effort variants
+        // from the catalog/registry join land without a per-provider enrich
+        // opt-in; capabilities and limit stay enrich-gated below (provider-
+        // rich parsing only happens under enrich, and join caps/limit for a
+        // gateway id would be one definer's values among many).
+        const resolution = resolveModelMetadata(
+          providerID,
+          modelEntry.id,
+          modelEntry.enrich === true ? modelEntry.metadata : undefined,
+          joinCandidates,
+        );
         // Merge semantics: entries from a merge cycle, or ids recorded in the
         // merged set (replay/restart re-apply), gap-fill instead of override.
         const mergeMode =
@@ -1490,10 +1497,12 @@ export function applyDiscovered(
             }
             return;
           }
-          if (resolution.metadata?.capabilities) {
+          if (modelEntry.enrich === true && resolution.metadata?.capabilities) {
             richModel.capabilities = resolution.metadata.capabilities;
           }
-          if (resolution.metadata?.limit) richModel.limit = resolution.metadata.limit;
+          if (modelEntry.enrich === true && resolution.metadata?.limit) {
+            richModel.limit = resolution.metadata.limit;
+          }
           if (resolution.metadata?.variants) richModel.variants = resolution.metadata.variants;
         });
       } catch {
