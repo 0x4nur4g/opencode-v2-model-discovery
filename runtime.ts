@@ -1082,6 +1082,8 @@ export interface RefreshSummary {
   withModels?: string[];
   /** Provider ids skipped because requireAuth found no credential. */
   skipped?: string[];
+  /** Per-provider model id changes vs before this cycle (successful polls only). */
+  changes?: Array<[string, { added: number; removed: number }]>;
 }
 
 /** Extra per-cycle context the ack surfaces can render. */
@@ -1089,6 +1091,8 @@ export interface RefreshSummaryExtras {
   readonly failures?: readonly ProviderPollFailure[];
   readonly withModels?: readonly string[];
   readonly skipped?: readonly string[];
+  /** Model ids held before this cycle, per provider: the diff base. */
+  readonly previousIds?: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
 /**
@@ -1109,6 +1113,18 @@ export function buildRefreshSummary(
     if (models === undefined) failed.push(target.id);
     else discoveredCounts.push([target.id, models.length]);
   }
+  const changes: Array<[string, { added: number; removed: number }]> = [];
+  if (extras?.previousIds !== undefined) {
+    for (const [providerID] of discoveredCounts) {
+      const before = extras.previousIds.get(providerID) ?? new Set<string>();
+      const after = new Set((results.get(providerID) ?? []).map((model) => model.id));
+      let added = 0;
+      let removed = 0;
+      for (const id of after) if (!before.has(id)) added += 1;
+      for (const id of before) if (!after.has(id)) removed += 1;
+      changes.push([providerID, { added, removed }]);
+    }
+  }
   return {
     outcome: "complete",
     polled: due.length - (extras?.skipped?.length ?? 0),
@@ -1117,6 +1133,7 @@ export function buildRefreshSummary(
     ...(extras?.failures !== undefined ? { failures: [...extras.failures] } : {}),
     ...(extras?.withModels !== undefined ? { withModels: [...extras.withModels] } : {}),
     ...(extras?.skipped !== undefined ? { skipped: [...extras.skipped] } : {}),
+    ...(extras?.previousIds !== undefined ? { changes } : {}),
   };
 }
 
@@ -1167,10 +1184,27 @@ export function formatRescanAck(summary: RefreshSummary): string {
     return "Models-discovery rescan failed; previous models kept. Check server logs.";
   }
   const total = summary.discoveredCounts.reduce((sum, [, count]) => sum + count, 0);
-  return [
+  const parts = [
     `Models-discovery rescan complete: ${total} model(s) across ${summary.discoveredCounts.length} provider(s).`,
-    ...failureClauses(summary),
-  ].join(" ");
+  ];
+  if (summary.changes !== undefined) {
+    const changed = summary.changes.filter(([, delta]) => delta.added > 0 || delta.removed > 0);
+    if (changed.length === 0) {
+      parts.push("No model changes.");
+    } else {
+      const detail = changed
+        .map(([providerID, delta]) => {
+          const bits: string[] = [];
+          if (delta.added > 0) bits.push(`+${delta.added}`);
+          if (delta.removed > 0) bits.push(`-${delta.removed}`);
+          return `${providerID} ${bits.join(" ")}`;
+        })
+        .join(", ");
+      parts.push(`Changes: ${detail}.`);
+    }
+  }
+  parts.push(...failureClauses(summary));
+  return parts.join(" ");
 }
 
 /** Format a merge ack message; sanitized (ids, markers, and counts only). */
@@ -1909,6 +1943,13 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
       const withModels = [...discovered]
         .filter(([, models]) => models.length > 0)
         .map(([providerID]) => providerID);
+      // Diff base for the completion ack: model ids held before this cycle.
+      const previousIds = new Map(
+        [...discovered].map(
+          ([providerID, models]) =>
+            [providerID, new Set(models.map((model) => model.id))] as const,
+        ),
+      );
       const storeAuthResolver = createStoreAuthResolver(ctx);
       await enrichTargetsWithStoreAuth(due, storeAuthResolver);
       // requireAuth: skip providers with no resolvable credential instead of
@@ -2066,6 +2107,7 @@ async function setupInternal(ctx: PluginContextLite): Promise<Cleanup | void> {
         failures: [...cycleFailures].map(([providerID, failure]) => ({ providerID, ...failure })),
         withModels,
         skipped,
+        previousIds,
       });
     } catch {
       safeFailure("refresh", "runtime");

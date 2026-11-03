@@ -1535,7 +1535,7 @@ describe("rescan triggers", () => {
       );
       expect(acks[1].description).toBe("models-discovery-rescan");
       expect(acks[1].text).toMatch(
-        /^Models-discovery rescan complete: 1 model\(s\) across 1 provider\(s\)\. \[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]$/,
+        /^Models-discovery rescan complete: 1 model\(s\) across 1 provider\(s\)\. No model changes\. \[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]$/,
       );
 
       // Headless invocation (no sessionID) still refreshes but posts no acks.
@@ -4572,7 +4572,10 @@ describe("tui effort shortcut", () => {
     expect(layer.priority).toBe(10);
     expect(layer.commands[0].id).toBe("models-discovery.effort-shortcut");
     expect(layer.commands[0].bind).toBe("ctrl+t");
-    expect(layer.bindings).toEqual(["models-discovery.effort-shortcut"]);
+    expect(layer.bindings).toEqual([
+      "models-discovery.effort-shortcut",
+      "models-discovery.rescan-now",
+    ]);
   });
 
   test("delegate uses the native cycle surface when present", async () => {

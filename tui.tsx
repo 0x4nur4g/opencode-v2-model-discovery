@@ -22,7 +22,9 @@ type TuiCtxLite = {
       };
       current?: () => TuiModelRef | undefined;
     };
-    toast?: { show?: (input: { message: string; variant?: string; title?: string }) => void };
+    toast?: {
+      show?: (input: { message: string; variant?: string; title?: string; duration?: number }) => void;
+    };
     router?: { current?: () => { type: string; sessionID?: string } | undefined };
     slot?: (claim: { append: string; render: () => unknown }) => void;
   };
@@ -41,6 +43,62 @@ const HINT_MESSAGE =
 const ARM_WINDOW_MS = 5000;
 const TRIGGER_COOLDOWN_MS = 5000;
 const MERGE_COMMAND = "models-discovery-merge";
+const RESCAN_COMMAND = "models-discovery-rescan";
+/** Long duration: the toast stays up while the rescan runs (closable via its x). */
+const PROGRESS_TOAST_DURATION_MS = 3600000;
+
+let rescanInFlight = false;
+
+/**
+ * Rescan with a progress toast: a persistent toast while the server command
+ * runs, replaced by a completion toast when it returns. Detail (counts and
+ * changes) lands in the chat via the server ack; the toast is the signal.
+ */
+async function runRescanWithToast(ctx: TuiCtxLite): Promise<boolean> {
+  const sessionID = safeSessionId(ctx);
+  if (sessionID === undefined) {
+    toast(ctx, {
+      message: "Open a chat session first — rescan results arrive in the chat.",
+      variant: "warning",
+      title: "Models discovery",
+    });
+    return true;
+  }
+  if (rescanInFlight) {
+    toast(ctx, {
+      message: "A rescan is already running.",
+      variant: "warning",
+      title: "Models discovery",
+    });
+    return true;
+  }
+  const session = ctx.client?.session;
+  const command = session?.command;
+  if (typeof command !== "function") {
+    toast(ctx, { message: "Rescan unavailable: session command missing.", variant: "error" });
+    return true;
+  }
+  rescanInFlight = true;
+  toast(ctx, {
+    message: "Rescan running… per-provider results land in the chat.",
+    variant: "info",
+    title: "Models discovery",
+    duration: PROGRESS_TOAST_DURATION_MS,
+  });
+  try {
+    await command.call(session, { sessionID, name: RESCAN_COMMAND, text: "" });
+    toast(ctx, {
+      message: "Rescan complete. See the chat note, or /models-discovery-status, for counts and changes.",
+      variant: "success",
+      title: "Models discovery",
+    });
+  } catch (error) {
+    toast(ctx, { message: `Rescan failed: ${safeErrorName(error)}`, variant: "error" });
+  } finally {
+    rescanInFlight = false;
+  }
+  return true;
+}
 
 let pending: EffortSnapshot | undefined;
 let cooldownUntil = 0;
@@ -121,7 +179,10 @@ function safeSessionId(ctx: TuiCtxLite): string | undefined {
   }
 }
 
-function toast(ctx: TuiCtxLite, input: { message: string; variant?: string; title?: string }): void {
+function toast(
+  ctx: TuiCtxLite,
+  input: { message: string; variant?: string; title?: string; duration?: number },
+): void {
   try {
     ctx.ui?.toast?.show?.(input);
   } catch {
@@ -218,7 +279,7 @@ async function handler(ctx: TuiCtxLite): Promise<boolean> {
       }
       await command.call(session, { sessionID, name: MERGE_COMMAND, text: providerID });
       toast(ctx, {
-        message: `Discovery merge started for ${providerID}.`,
+        message: `Discovery merge finished for ${providerID}. Reopen the model picker to see new efforts.`,
         variant: "success",
         title: "Models discovery",
       });
@@ -254,8 +315,15 @@ export function setup(context: unknown): void {
             bind: "ctrl+t",
             run: () => handler(ctx),
           },
+          {
+            id: "models-discovery.rescan-now",
+            title: "Models Discovery: rescan now",
+            group: "Models Discovery",
+            bind: "ctrl+shift+t",
+            run: () => runRescanWithToast(ctx),
+          },
         ],
-        bindings: ["models-discovery.effort-shortcut"],
+        bindings: ["models-discovery.effort-shortcut", "models-discovery.rescan-now"],
       }));
       registered = true;
     } catch {
